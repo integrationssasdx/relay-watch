@@ -17,6 +17,12 @@
 一个输入可承载多个 ``chain_id``：sequence 仅在同一链内唯一（同链重复抛
 InvalidInputError），不同链可复用同一 sequence；各链事件可交错，报告严格按
 输入行序生成。续传与去重身份为 ``(chain_id, sequence)``。
+
+默认严格处理：首个证明失败事件立即抛 ProofVerificationError。传入
+``tolerate_failures=True`` 进入隔离模式后，结构合法事件逐条独立处理，证明
+失败转为 ``proof_status="failed"`` 报告行（携带 error_type/error_message），
+不阻断后续事件；成功与失败都算已处理并推进检查点。结构性输入/检查点错误在
+两种模式下都直接抛出。
 """
 
 from __future__ import annotations
@@ -379,22 +385,47 @@ def _attribution(source_ms: int, relay_ms: int, destination_ms: int) -> str:
     return _RELAY
 
 
-def build_report(event: dict) -> dict:
+def _latency_fields(event: dict) -> dict:
+    """三段延迟与归因；成功行与隔离模式的失败行口径完全一致。"""
     proof_latency = event["proof_verified_at"] - event["proof_submitted_at"]
     relay_latency = event["proof_verified_at"] - event["observed_at"]
     destination_latency = event["finalized_at"] - event["proof_verified_at"]
-
     return {
-        "event_id": event["event_id"],
-        "chain_id": event["chain_id"],
-        "sequence": event["sequence"],
-        "proof_status": "verified",
         "proof_latency_ms": proof_latency,
         "relay_latency_ms": relay_latency,
         "destination_latency_ms": destination_latency,
         "attribution": _attribution(
             proof_latency, relay_latency, destination_latency
         ),
+    }
+
+
+def build_report(event: dict) -> dict:
+    return {
+        "event_id": event["event_id"],
+        "chain_id": event["chain_id"],
+        "sequence": event["sequence"],
+        "proof_status": "verified",
+        **_latency_fields(event),
+        "finalized_at": event["finalized_at"],
+    }
+
+
+def build_failed_report(event: dict, exc: ProofVerificationError) -> dict:
+    """隔离模式下证明失败的事件行。
+
+    数值字段（三段延迟、归因、finalized_at）与成功行同一口径；证明结果以
+    ``proof_status="failed"`` 加 ``error_type``/``error_message`` 表达，其中
+    错误文本即原 ``ProofVerificationError`` 的异常文本。
+    """
+    return {
+        "event_id": event["event_id"],
+        "chain_id": event["chain_id"],
+        "sequence": event["sequence"],
+        "proof_status": "failed",
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        **_latency_fields(event),
         "finalized_at": event["finalized_at"],
     }
 
@@ -672,13 +703,22 @@ def watch(
     input_path: PathLike,
     checkpoint: Optional[PathLike] = None,
     output_path: Optional[PathLike] = None,
+    tolerate_failures: bool = False,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
     一个输入可承载多个 chain_id；选择与续传身份为 (chain_id, sequence)。
-    给定 output_path 时原子写 JSONL 报告；仅当所有被选中事件都验证成功后，
-    才原子推进 checkpoint（若给出），且各链只推进到本次成功处理的最大
+    给定 output_path 时原子写 JSONL 报告；仅当所有被选中事件都有确定结果
+    后，才原子推进 checkpoint（若给出），且各链只推进到本次已处理的最大
     sequence。
+
+    严格模式（``tolerate_failures=False``，默认，兼容旧行为）下，结构合法但
+    证明失败的首个事件立即抛 :class:`ProofVerificationError`，不写报告、不推进
+    检查点。隔离模式（``tolerate_failures=True``）下，每个结构合法事件独立
+    处理：成功者为 ``proof_status="verified"`` 行，失败者为
+    ``proof_status="failed"`` 行（携带 error_type/error_message）；成功与失败
+    都算“已处理”，同样推进检查点，同链后续事件不受先前失败影响。结构性输入
+    错误与检查点错误在两种模式下都直接抛出，不写报告、不推进检查点。
     """
     events = load_events(input_path)
 
@@ -700,8 +740,14 @@ def watch(
 
     reports: list[dict] = []
     for event in selected:
-        verify_proof(event)
-        reports.append(build_report(event))
+        try:
+            verify_proof(event)
+        except ProofVerificationError as exc:
+            if not tolerate_failures:
+                raise
+            reports.append(build_failed_report(event, exc))
+        else:
+            reports.append(build_report(event))
 
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
     # 事件；续传时累积发布按 (chain_id, sequence) 去重，因此即便重选也不会
@@ -719,7 +765,8 @@ def watch(
             sequence = event["sequence"]
             if sequence > new_cursors.get(chain, -1):
                 new_cursors[chain] = sequence
-        # 旧版 last_sequence 检查点在此随单链成功处理一并升级为 v2。
+        # 旧版 last_sequence 检查点在此随单链处理完成一并升级为 v2（隔离模
+        # 式下成功或失败行都算已处理，同样触发升级）。
         _atomic_write(checkpoint, _render_checkpoint(new_cursors))
 
     return reports
@@ -729,6 +776,10 @@ def run(
     input: PathLike,
     checkpoint: Optional[PathLike] = None,
     output: Optional[PathLike] = None,
+    tolerate_failures: bool = False,
 ) -> list[dict]:
-    """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。"""
-    return watch(input, checkpoint, output)
+    """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
+
+    ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）。
+    """
+    return watch(input, checkpoint, output, tolerate_failures)

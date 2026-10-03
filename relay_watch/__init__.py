@@ -7,11 +7,22 @@
 ``{"schema_version": 2, "last_sequence_by_chain": {...}}``，旧版
 last_sequence 检查点仍可读（仅限单链输入，成功后升级）。
 
+严格处理为默认：首个结构合法但证明失败的事件立即抛 ProofVerificationError，
+不写报告、不推进检查点。传入 ``tolerate_failures=True``（CLI：
+``--tolerate-failures``）进入逐事件失败隔离模式：每条结构合法事件独立处理，
+成功行为 ``proof_status="verified"``，失败行为 ``proof_status="failed"`` 并
+携带 ``error_type="ProofVerificationError"`` 与原异常文本 ``error_message``；
+失败行的延迟、归因、finalized_at 口径与成功行一致，成功与失败都算已处理并
+推进检查点。结构性输入错误与检查点错误在两种模式下都直接抛出、不写报告、不
+推进检查点。
+
 公共入口：
 
-* ``relay_watch.run(input, checkpoint=None, output=None)`` -> list[dict]
+* ``relay_watch.run(input, checkpoint=None, output=None,
+  tolerate_failures=False)`` -> list[dict]
   与命令行同参的模块 API；
-* ``python -m relay_watch --input IN --checkpoint CP --output OUT``；
+* ``python -m relay_watch --input IN --checkpoint CP --output OUT
+  [--tolerate-failures [{true,false}]]``；
 * ``relay-watch`` 可执行文件。
 """
 

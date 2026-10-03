@@ -1,6 +1,7 @@
 """relay-watch 命令行接口。
 
 relay-watch --input IN --checkpoint CP --output OUT
+    [--tolerate-failures [{true,false}]]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -39,6 +40,16 @@ def emit_error(error: str, message: str) -> None:
     )
 
 
+def _tolerate_failures_value(value: str) -> bool:
+    """解析 --tolerate-failures 的布尔取值（仅接受小写 true/false）。"""
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    # argparse 会在此消息前补 "argument --tolerate-failures: "。
+    raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _JsonArgumentParser(
         prog="relay-watch",
@@ -69,6 +80,19 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OUT",
         help="JSONL 报告输出路径（原子写出）",
     )
+    parser.add_argument(
+        "--tolerate-failures",
+        metavar="{true,false}",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_tolerate_failures_value,
+        help=(
+            "逐事件失败隔离：true 时单条证明失败转为 proof_status=failed "
+            "的报告行，不阻断后续事件与检查点推进；false（默认）为严格模式，"
+            "首个证明失败立即报错退出。裸用该标志等价于 true。"
+        ),
+    )
     return parser
 
 
@@ -77,7 +101,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run(args.input, args.checkpoint, args.output)
+        run(
+            args.input,
+            args.checkpoint,
+            args.output,
+            tolerate_failures=args.tolerate_failures,
+        )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))
         return 1
