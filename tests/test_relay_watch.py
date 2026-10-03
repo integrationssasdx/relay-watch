@@ -389,7 +389,10 @@ def test_checkpoint_resume_processes_only_greater_sequences(workspace):
     )
     reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
     assert [r["sequence"] for r in reports] == [2, 3]
-    assert json.loads(workspace["checkpoint"].read_text())["last_sequence"] == 3
+    # 单链输入成功后，旧检查点升级为 schema_version 2 的按链游标。
+    upgraded = json.loads(workspace["checkpoint"].read_text())
+    assert upgraded["schema_version"] == 2
+    assert upgraded["last_sequence_by_chain"] == {"chain-7": 3}
 
 
 def test_resume_is_idempotent_no_duplicate_output(workspace):
@@ -545,3 +548,472 @@ def test_relay_watch_executable_entry_point(workspace):
     )
     assert result.returncode == 0, result.stderr
     assert workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain inputs
+# ---------------------------------------------------------------------------
+
+
+def make_chain_event(chain_id, event_id, sequence, **overrides):
+    """A verifiable event on an arbitrary chain; proof binds that chain_id."""
+    sigs = list(SIGS)
+    proof = {
+        "light_client_version": "v1",
+        "trusted_root": sorted(_trusted_roots("v1", "0xdeadbeef"))[1],
+        "header_hash": "0xdeadbeef",
+        "validator_set_hash": _validator_set_hash("v1", chain_id, sigs),
+        "signatures": sigs,
+        "quorum": 2,
+    }
+    event = {
+        "event_id": event_id,
+        "chain_id": chain_id,
+        "sequence": sequence,
+        "observed_at": sequence * 1000,
+        "proof_submitted_at": sequence * 1000 + 100,
+        "proof_verified_at": sequence * 1000 + 500,
+        "finalized_at": sequence * 1000 + 1400,
+        "proof": proof,
+    }
+    for key, value in overrides.items():
+        if key in proof:
+            proof[key] = value
+        else:
+            event[key] = value
+    return event
+
+
+def v2_checkpoint(cursors):
+    return {"schema_version": 2, "last_sequence_by_chain": cursors}
+
+
+def test_multi_chain_events_may_share_sequence(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+    ]
+    write_events(workspace["input"], events)
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 1),
+        ("chain-b", 1),
+    ]
+
+
+def test_multi_chain_reports_keep_input_order_when_interleaved(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+        make_chain_event("chain-a", "A2", 2),
+        make_chain_event("chain-b", "B2", 2),
+    ]
+    write_events(workspace["input"], events)
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 1),
+        ("chain-b", 1),
+        ("chain-a", 2),
+        ("chain-b", 2),
+    ]
+    # chain_id identifies the chain and is the leading field on multi rows.
+    assert all(list(row)[0] == "chain_id" for row in reports)
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["chain_id"] for line in lines] == [
+        "chain-a",
+        "chain-b",
+        "chain-a",
+        "chain-b",
+    ]
+
+
+def test_single_chain_report_has_no_chain_id_field(workspace):
+    write_events(
+        workspace["input"],
+        [make_chain_event("chain-7", "E1", 1)],
+    )
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert "chain_id" not in reports[0]
+
+
+def test_duplicate_sequence_within_same_chain_in_multi_input_is_invalid(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+        make_chain_event("chain-a", "A1-dup", 1),
+    ]
+    write_events(workspace["input"], events)
+    with pytest.raises(InvalidInputError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_timestamps_may_coincide_across_chains_but_not_within_one(workspace):
+    # Both chains reuse the exact same timestamps; uniqueness is per chain.
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+    ]
+    write_events(workspace["input"], events)
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert len(reports) == 2
+
+    # Reusing a timestamp twice within chain-a is still rejected.
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event(
+            "chain-a", "A2", 2, observed_at=1000,
+            proof_submitted_at=5100, proof_verified_at=5500, finalized_at=6400,
+        ),
+    ]
+    write_events(workspace["input"], events)
+    with pytest.raises(InvalidInputError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+# ---------------------------------------------------------------------------
+# Schema-version-2 checkpoints
+# ---------------------------------------------------------------------------
+
+
+def test_v2_checkpoint_resumes_each_chain_independently(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+        make_chain_event("chain-a", "A2", 2),
+        make_chain_event("chain-b", "B2", 2),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 1, "chain-b": 1})),
+        encoding="utf-8",
+    )
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    selected = [(r["chain_id"], r["sequence"]) for r in reports]
+    assert selected == [("chain-a", 2), ("chain-b", 2)]
+
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-a": 2, "chain-b": 2})
+
+
+def test_v2_checkpoint_missing_chain_starts_from_first(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-a", "A2", 2),
+        make_chain_event("chain-b", "B1", 1),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 2})), encoding="utf-8"
+    )
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-b", 1)
+    ]
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-a": 2, "chain-b": 1})
+
+
+def test_v2_checkpoint_only_advances_successfully_processed_chains(workspace):
+    events = [
+        make_chain_event("chain-a", "A3", 3),
+        make_chain_event("chain-b", "B5", 5),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 1, "chain-b": 2, "chain-c": 9})),
+        encoding="utf-8",
+    )
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 3),
+        ("chain-b", 5),
+    ]
+    # chain-c is absent from the input: its prior cursor is carried through.
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint(
+        {"chain-a": 3, "chain-b": 5, "chain-c": 9}
+    )
+
+
+def test_legacy_checkpoint_rejected_for_multi_chain_input(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 0}), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    # Checkpoint untouched after the rejection.
+    assert json.loads(workspace["checkpoint"].read_text()) == {"last_sequence": 0}
+
+
+def test_legacy_checkpoint_single_chain_upgrades_to_v2(workspace):
+    write_events(workspace["input"], [make_chain_event("chain-7", "E2", 2)])
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 1}), encoding="utf-8"
+    )
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [(r["sequence"]) for r in reports] == [2]
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-7": 2})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},
+        {"schema_version": 2},
+        {"last_sequence_by_chain": {"chain-a": 1}},
+        {"schema_version": 2, "last_sequence_by_chain": None},
+        {"schema_version": 2, "last_sequence_by_chain": []},
+        {"schema_version": 2, "last_sequence_by_chain": {}, "extra": 1},
+        {"schema_version": 3, "last_sequence_by_chain": {}},
+        {"schema_version": None, "last_sequence_by_chain": {}},
+        {"schema_version": "2", "last_sequence_by_chain": {}},
+    ],
+)
+def test_v2_malformed_checkpoint_is_invalid_input(workspace, raw):
+    write_events(
+        workspace["input"],
+        [make_chain_event("chain-a", "A1", 1)],
+    )
+    workspace["checkpoint"].write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+@pytest.mark.parametrize(
+    "cursors",
+    [
+        {"chain-a": -1},
+        {"chain-a": 1.5},
+        {"chain-a": "1"},
+        {"chain-a": True},
+        {"chain-a": None},
+        {"chain-a": [1]},
+        {"": 1},
+    ],
+)
+def test_v2_bad_cursor_or_chain_id_is_checkpoint_error(workspace, cursors):
+    write_events(
+        workspace["input"],
+        [make_chain_event("chain-a", "A1", 1), make_chain_event("chain-a", "A2", 2)],
+    )
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint(cursors)), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_v2_cursor_above_that_chains_maximum_is_checkpoint_error(workspace):
+    events = [
+        make_chain_event("chain-a", "A2", 2),
+        make_chain_event("chain-b", "B9", 9),
+    ]
+    write_events(workspace["input"], events)
+    # chain-a's cursor (5) exceeds its input max (2); chain-b (3 <= 9) is fine.
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 5, "chain-b": 3})),
+        encoding="utf-8",
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain resume: idempotency, appending and atomicity
+# ---------------------------------------------------------------------------
+
+
+def test_multi_chain_resume_is_idempotent(workspace):
+    events = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+        make_chain_event("chain-a", "A2", 2),
+        make_chain_event("chain-b", "B2", 2),
+    ]
+    write_events(workspace["input"], events)
+
+    first = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert len(first) == 4
+    checkpoint_after_first = workspace["checkpoint"].read_text(encoding="utf-8")
+
+    second = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert second == []
+    assert workspace["checkpoint"].read_text(encoding="utf-8") == checkpoint_after_first
+
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    identities = sorted(
+        (json.loads(line)["chain_id"], json.loads(line)["sequence"])
+        for line in lines
+    )
+    assert identities == [
+        ("chain-a", 1),
+        ("chain-a", 2),
+        ("chain-b", 1),
+        ("chain-b", 2),
+    ]
+
+
+def test_resume_appends_only_new_chain_and_new_events(workspace):
+    write_events(
+        workspace["input"],
+        [
+            make_chain_event("chain-a", "A1", 1),
+            make_chain_event("chain-a", "A2", 2),
+        ],
+    )
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # A later batch extends chain-a and introduces chain-b.
+    write_events(
+        workspace["input"],
+        [
+            make_chain_event("chain-a", "A1", 1),
+            make_chain_event("chain-b", "B1", 1),
+            make_chain_event("chain-a", "A2", 2),
+            make_chain_event("chain-b", "B2", 2),
+            make_chain_event("chain-a", "A3", 3),
+        ],
+    )
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # Newly processed rows follow input line order.
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-b", 1),
+        ("chain-b", 2),
+        ("chain-a", 3),
+    ]
+
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    identities = [
+        (json.loads(line).get("chain_id", "chain-a"), json.loads(line)["sequence"])
+        for line in lines
+    ]
+    # Existing rows keep their position; new rows append, no duplicates.
+    assert identities == [
+        ("chain-a", 1),
+        ("chain-a", 2),
+        ("chain-b", 1),
+        ("chain-b", 2),
+        ("chain-a", 3),
+    ]
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-a": 3, "chain-b": 2})
+
+
+def test_multi_chain_failure_leaves_prior_output_and_checkpoint_unchanged(
+    workspace,
+):
+    good = [
+        make_chain_event("chain-a", "A1", 1),
+        make_chain_event("chain-b", "B1", 1),
+    ]
+    bad = make_chain_event(
+        "chain-a", "A2", 2, signatures=["0xaa11"], quorum=2,
+        proof_submitted_at=2100, proof_verified_at=2500, finalized_at=3400,
+    )
+    write_events(workspace["input"], good + [bad])
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 0, "chain-b": 0})),
+        encoding="utf-8",
+    )
+    workspace["output"].write_text("PRIOR-CONTENT\n", encoding="utf-8")
+
+    with pytest.raises(ProofVerificationError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert workspace["output"].read_text(encoding="utf-8") == "PRIOR-CONTENT\n"
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-a": 0, "chain-b": 0})
+
+
+def test_empty_input_with_v2_checkpoint_is_a_noop(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 7})), encoding="utf-8"
+    )
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert reports == []
+    assert not workspace["output"].exists()
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved == v2_checkpoint({"chain-a": 7})
+
+
+# ---------------------------------------------------------------------------
+# Command line interface with multiple chains
+# ---------------------------------------------------------------------------
+
+
+def test_cli_multi_chain_success_empty_stdout(workspace):
+    write_events(
+        workspace["input"],
+        [
+            make_chain_event("chain-a", "A1", 1),
+            make_chain_event("chain-b", "B1", 1),
+        ],
+    )
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["chain_id"] for line in lines] == [
+        "chain-a",
+        "chain-b",
+    ]
+    saved = json.loads(workspace["checkpoint"].read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+
+
+def test_cli_legacy_checkpoint_with_multi_chain_input_errors(workspace):
+    write_events(
+        workspace["input"],
+        [
+            make_chain_event("chain-a", "A1", 1),
+            make_chain_event("chain-b", "B1", 1),
+        ],
+    )
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 0}), encoding="utf-8"
+    )
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "CheckpointError"
+    assert not workspace["output"].exists()
+
+
+def test_cli_v2_malformed_checkpoint_errors(workspace):
+    write_events(workspace["input"], [make_chain_event("chain-a", "A1", 1)])
+    workspace["checkpoint"].write_text(
+        json.dumps({"schema_version": 2, "last_sequence_by_chain": None}),
+        encoding="utf-8",
+    )
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "InvalidInputError"

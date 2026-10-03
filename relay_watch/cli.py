@@ -57,7 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint",
         required=True,
         metavar="CP",
-        help="携带 last_sequence 的检查点 JSON 文件；文件缺失表示从头处理",
+        help=(
+            "按链记录续传游标的检查点 JSON 文件（schema_version 2，含 "
+            "last_sequence_by_chain）；旧版 last_sequence 检查点在单链输入"
+            "下可读并于成功后升级；文件缺失表示从头处理"
+        ),
     )
     parser.add_argument(
         "--output",
