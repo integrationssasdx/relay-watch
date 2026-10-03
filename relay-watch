@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Executable entry point for the relay-watch command.
+
+Runs from a source checkout without installation by ensuring the repository
+directory (which contains the ``relay_watch`` package) is importable.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from relay_watch.__main__ import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
