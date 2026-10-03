@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay-watch"
+version = "1.0.0"
+description = "Offline cross-chain relay reliability monitoring: light-client proof checks, latency attribution and checkpoint resume."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "integrationssasdx" }]
+
+[project.scripts]
+relay-watch = "relay_watch.cli:main"
+
+[tool.setuptools]
+packages = ["relay_watch"]

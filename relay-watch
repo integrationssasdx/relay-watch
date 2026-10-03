@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""relay-watch 命令的可执行入口。
+
+无需安装即可在源码检出目录运行：确保包含 ``relay_watch`` 包的仓库目录可被
+导入。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from relay_watch.__main__ import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
