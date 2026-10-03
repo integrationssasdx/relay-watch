@@ -1,9 +1,11 @@
 """relay-watch 命令行接口。
 
-relay-watch --input IN --checkpoint CP --output OUT
+relay-watch --input IN --checkpoint CP --output OUT [--tolerate-failures]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
+严格模式（默认）下首个证明失败即如此；--tolerate-failures 进入隔离模式，
+证明失败不报错退出，而是写入 proof_status=failed 的报告行。
 """
 
 from __future__ import annotations
@@ -69,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OUT",
         help="JSONL 报告输出路径（原子写出）",
     )
+    parser.add_argument(
+        "--tolerate-failures",
+        dest="tolerate_failures",
+        action="store_true",
+        default=False,
+        help=(
+            "逐事件失败隔离：单条证明失败转成 proof_status=failed 的报告行，"
+            "不阻断后续校验、归因与报告生成，检查点照常推进。"
+            "默认关闭（严格模式）：首个证明失败即以非零码退出，不写报告、"
+            "不推进检查点。"
+        ),
+    )
     return parser
 
 
@@ -77,7 +91,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run(args.input, args.checkpoint, args.output)
+        run(
+            args.input,
+            args.checkpoint,
+            args.output,
+            tolerate_failures=args.tolerate_failures,
+        )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))
         return 1

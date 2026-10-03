@@ -7,11 +7,19 @@
 ``{"schema_version": 2, "last_sequence_by_chain": {...}}``，旧版
 last_sequence 检查点仍可读（仅限单链输入，成功后升级）。
 
+默认严格处理：首个 ProofVerificationError 立即失败，不写报告、不推进检查
+点。传入 tolerate_failures=True（CLI 为 --tolerate-failures）进入隔离
+模式：单条证明失败转成 proof_status="failed"（带 error_type 与
+error_message）的报告行，不影响后续事件，成功与失败都推进检查点。
+
 公共入口：
 
-* ``relay_watch.run(input, checkpoint=None, output=None)`` -> list[dict]
-  与命令行同参的模块 API；
-* ``python -m relay_watch --input IN --checkpoint CP --output OUT``；
+* ``relay_watch.run(input, checkpoint=None, output=None,
+  tolerate_failures=False)`` -> list[dict]
+  与命令行同参的模块 API；tolerate_failures=True 进入逐事件失败隔离模式，
+  单条证明失败转成 proof_status="failed" 报告行而不抛出；
+* ``python -m relay_watch --input IN --checkpoint CP --output OUT
+  [--tolerate-failures]``；
 * ``relay-watch`` 可执行文件。
 """
 

@@ -15,7 +15,11 @@ from relay_watch import (
     ProofVerificationError,
     run,
 )
-from relay_watch.core import _trusted_roots, _validator_set_hash
+from relay_watch.core import (
+    _trusted_roots,
+    _validator_set_hash,
+    verify_proof,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1153,4 +1157,397 @@ def test_cli_malformed_v2_checkpoint_is_invalid_input_error(workspace):
     )
     assert result.returncode != 0
     assert json.loads(result.stderr)["error"] == "InvalidInputError"
+    assert not workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# Tolerate-failures isolation mode
+# ---------------------------------------------------------------------------
+
+
+def failing_event(chain_id="chain-7", sequence=1, event_id="F1", base=1000):
+    """A structurally valid event whose proof cannot verify (below quorum)."""
+    return chain_event(
+        chain_id,
+        sequence,
+        event_id,
+        base,
+        signatures=["0xaa11"],
+        quorum=2,
+    )
+
+
+def proof_error_text(event):
+    """The exact message verify_proof raises for this structurally valid event."""
+    with pytest.raises(ProofVerificationError) as excinfo:
+        verify_proof(event)
+    return str(excinfo.value)
+
+
+def test_strict_mode_is_the_default_and_still_raises(workspace):
+    bad = failing_event(event_id="F1", sequence=1)
+    write_events(workspace["input"], [bad])
+    with pytest.raises(ProofVerificationError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert not workspace["output"].exists()
+
+
+def test_strict_mode_explicit_false_matches_default(workspace):
+    bad = failing_event(event_id="F1", sequence=1)
+    write_events(workspace["input"], [bad])
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=False,
+        )
+
+
+def test_tolerate_failures_returns_failed_row_with_error_fields(workspace):
+    bad = failing_event(event_id="F1", sequence=1)
+    write_events(workspace["input"], [bad])
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+
+    assert len(reports) == 1
+    row = reports[0]
+    assert row["proof_status"] == "failed"
+    assert row["error_type"] == "ProofVerificationError"
+    assert row["error_message"] == proof_error_text(bad)
+    # Identity, latencies, attribution and finalized_at are still emitted and
+    # use the same numeric convention as a verified row.
+    assert row["event_id"] == "F1"
+    assert row["chain_id"] == "chain-7"
+    assert row["sequence"] == 1
+    assert row["proof_latency_ms"] == 400
+    assert row["relay_latency_ms"] == 500
+    assert row["destination_latency_ms"] == 400
+    assert row["attribution"] == "relay"
+    assert row["finalized_at"] == 1900
+    assert set(row) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "error_type",
+        "error_message",
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+        "attribution",
+        "finalized_at",
+    }
+    # The failed row is persisted to the report.
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0]) == row
+
+
+def test_tolerate_failures_isolates_a_failure_between_good_events(workspace):
+    good1 = chain_event("chain-7", 1, "A1", 1000)
+    bad = failing_event(event_id="B2", sequence=2, base=2000)
+    good3 = chain_event("chain-7", 3, "A3", 3000)
+    write_events(workspace["input"], [good1, bad, good3])
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert [r["proof_status"] for r in reports] == ["verified", "failed", "verified"]
+    # The event after the failure is fully verified, not affected by the failure.
+    assert "error_type" not in reports[0] and "error_type" not in reports[2]
+    assert reports[1]["error_message"] == proof_error_text(bad)
+
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    # Both success and failure count as processed: cursor reaches the max.
+    assert checkpoint == v2_checkpoint({"chain-7": 3})
+
+
+def test_tolerate_failures_advances_per_chain_through_failures(workspace):
+    # chain-a fails at seq 2, chain-b is fine; interleaved input.
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-b", 1, "B1", 2000),
+        chain_event("chain-a", 2, "A2", 3000, signatures=["0xaa11"], quorum=2),
+        chain_event("chain-b", 2, "B2", 4000),
+        chain_event("chain-a", 3, "A3", 5000),
+    ]
+    write_events(workspace["input"], events)
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+
+    assert [(r["chain_id"], r["sequence"], r["proof_status"]) for r in reports] == [
+        ("chain-a", 1, "verified"),
+        ("chain-b", 1, "verified"),
+        ("chain-a", 2, "failed"),
+        ("chain-b", 2, "verified"),
+        ("chain-a", 3, "verified"),
+    ]
+    # A later event on the same chain as the failure is unaffected.
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v2_checkpoint({"chain-a": 3, "chain-b": 2})
+
+
+def test_tolerate_failures_dedupes_on_resume_and_rerun_is_deterministic(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+        chain_event("chain-b", 1, "B1", 3000),
+    ]
+    write_events(workspace["input"], events)
+
+    first = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    output_after_first = workspace["output"].read_text()
+    checkpoint_after_first = workspace["checkpoint"].read_text()
+
+    # Identical rerun: nothing selected, no duplicated rows.
+    second = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    assert second == []
+    assert workspace["output"].read_text() == output_after_first
+    assert workspace["checkpoint"].read_text() == checkpoint_after_first
+
+    rows = [json.loads(line) for line in output_after_first.splitlines()]
+    assert [(r["chain_id"], r["sequence"], r["proof_status"]) for r in rows] == [
+        ("chain-a", 1, "verified"),
+        ("chain-a", 2, "failed"),
+        ("chain-b", 1, "verified"),
+    ]
+
+
+def test_tolerate_failures_resume_appends_new_results_after_prior_failure(
+    workspace,
+):
+    first_batch = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+    ]
+    write_events(workspace["input"], first_batch)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+
+    second_batch = first_batch + [
+        chain_event("chain-a", 3, "A3", 3000),
+        chain_event("chain-b", 1, "B1", 4000),
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    # The failed seq-2 row is not re-selected or re-appended.
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 3),
+        ("chain-b", 1),
+    ]
+    rows = [
+        json.loads(line)
+        for line in workspace["output"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(r["chain_id"], r["sequence"], r["proof_status"]) for r in rows] == [
+        ("chain-a", 1, "verified"),
+        ("chain-a", 2, "failed"),
+        ("chain-a", 3, "verified"),
+        ("chain-b", 1, "verified"),
+    ]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v2_checkpoint({"chain-a": 3, "chain-b": 1})
+
+
+def test_tolerate_failures_fresh_start_atomically_replaces_stale_report(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+    ]
+    write_events(workspace["input"], events)
+    workspace["output"].write_text('{"sequence": 999}\n', encoding="utf-8")
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    assert [r["sequence"] for r in reports] == [1, 2]
+    lines = workspace["output"].read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["sequence"] for line in lines] == [1, 2]
+
+
+def test_tolerate_failures_legacy_single_chain_checkpoint_is_upgraded(workspace):
+    events = [
+        chain_event("chain-7", 1, "A1", 1000),
+        chain_event("chain-7", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 0}), encoding="utf-8"
+    )
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    assert [r["proof_status"] for r in reports] == ["verified", "failed"]
+    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
+        {"chain-7": 2}
+    )
+
+
+def test_tolerate_failures_legacy_checkpoint_multichain_still_errors(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-b", 1, "B1", 2000),
+    ]
+    write_events(workspace["input"], events)
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 0}), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=True,
+        )
+    assert not workspace["output"].exists()
+
+
+def test_tolerate_failures_structural_errors_still_raise_invalid_input(workspace):
+    # A malformed line is an InvalidInputError even in isolation mode.
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=True,
+        )
+    assert not workspace["output"].exists()
+
+
+def test_tolerate_failures_duplicate_sequence_still_raises(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 1, "A2", 2000),
+    ]
+    write_events(workspace["input"], events)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=True,
+        )
+    assert not workspace["output"].exists()
+
+
+def test_tolerate_failures_checkpoint_cursor_error_still_raises(workspace):
+    write_events(workspace["input"], [chain_event("chain-a", 1, "A1", 1000)])
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 99}), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=True,
+        )
+    assert not workspace["output"].exists()
+
+
+def test_tolerate_failures_output_is_deterministic_across_runs(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+        chain_event("chain-b", 1, "B1", 3000),
+    ]
+    write_events(workspace["input"], events)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    first_output = workspace["output"].read_text(encoding="utf-8")
+
+    # Replay from a fresh checkpoint/output over the same input.
+    cp2 = workspace["checkpoint"].with_name("cp2.json")
+    out2 = workspace["output"].with_name("report2.jsonl")
+    run(workspace["input"], cp2, out2, tolerate_failures=True)
+    assert out2.read_text(encoding="utf-8") == first_output
+
+
+def test_cli_tolerate_failures_writes_failed_rows_and_exits_zero(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000, signatures=["0xaa11"], quorum=2),
+        chain_event("chain-b", 1, "B1", 3000),
+    ]
+    write_events(workspace["input"], events)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = [
+        json.loads(line)
+        for line in workspace["output"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(r["chain_id"], r["sequence"], r["proof_status"]) for r in rows] == [
+        ("chain-a", 1, "verified"),
+        ("chain-a", 2, "failed"),
+        ("chain-b", 1, "verified"),
+    ]
+    failed = rows[1]
+    assert failed["error_type"] == "ProofVerificationError"
+    assert isinstance(failed["error_message"], str) and failed["error_message"]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v2_checkpoint({"chain-a": 2, "chain-b": 1})
+
+
+def test_cli_default_without_flag_keeps_strict_failure(workspace):
+    bad = failing_event(event_id="F1", sequence=1)
+    write_events(workspace["input"], [bad])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
     assert not workspace["output"].exists()
