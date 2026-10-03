@@ -13,6 +13,10 @@
 
 仅当去重后的签名集合达到 ``quorum``、声明的验证者集合哈希与签名者一致、
 可信根在给定轻客户端版本下认证了区块头哈希时，proof 才为 ``verified``。
+
+一个输入可承载多个 ``chain_id``：sequence 仅在同一链内唯一（同链重复抛
+InvalidInputError），不同链可复用同一 sequence；各链事件可交错，报告严格按
+输入行序生成。续传与去重身份为 ``(chain_id, sequence)``。
 """
 
 from __future__ import annotations
@@ -21,9 +25,13 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Union
 
 PathLike = Union[str, "os.PathLike[str]"]
+
+# 检查点结构版本；v2 以 chain_id 为键分别记录各链游标。
+SCHEMA_VERSION = 2
 
 EVENT_FIELDS = (
     "event_id",
@@ -239,9 +247,13 @@ def _check_time_order(events: Iterable[dict]) -> None:
 
 
 def load_events(source: PathLike) -> list[dict]:
-    """解析并结构性校验 UTF-8 JSONL 事件文件。"""
+    """解析并结构性校验 UTF-8 JSONL 事件文件。
+
+    一个输入可承载多个 ``chain_id``：sequence 仅在同一链内唯一，不同链复用
+    同一 sequence 合法。事件按文件中的输入行序返回（各链事件可交错）。
+    """
     events: list[dict] = []
-    seen_sequences: set[int] = set()
+    seen_sequences: dict[str, set[int]] = {}
     seen_timestamps: dict[str, set[int]] = {
         name: set() for name in TIME_FIELDS
     }
@@ -254,12 +266,13 @@ def load_events(source: PathLike) -> list[dict]:
                 raw = _parse_json_line(text, lineno)
                 event = _validate_event(raw, lineno)
 
-                if event["sequence"] in seen_sequences:
+                chain_seen = seen_sequences.setdefault(event["chain_id"], set())
+                if event["sequence"] in chain_seen:
                     raise InvalidInputError(
                         f"event {event['event_id']!r}: duplicate sequence "
-                        f"{event['sequence']}"
+                        f"{event['sequence']} on chain {event['chain_id']!r}"
                     )
-                seen_sequences.add(event["sequence"])
+                chain_seen.add(event["sequence"])
 
                 # 每个时间字段在该列内跨事件唯一；不同列允许相同。
                 for name in TIME_FIELDS:
@@ -373,6 +386,7 @@ def build_report(event: dict) -> dict:
 
     return {
         "event_id": event["event_id"],
+        "chain_id": event["chain_id"],
         "sequence": event["sequence"],
         "proof_status": "verified",
         "proof_latency_ms": proof_latency,
@@ -388,8 +402,102 @@ def build_report(event: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # 检查点
 # --------------------------------------------------------------------------- #
-def load_checkpoint(path: PathLike) -> Optional[int]:
-    """返回 CP 中的 last_sequence；文件不存在返回 None。"""
+#
+# v2 检查点为::
+#
+#     {"schema_version": 2,
+#      "last_sequence_by_chain": {"chain-a": 3, "chain-b": 7}}
+#
+# 结构问题（无法解析、缺键、null、数组、未知字段、schema_version 取值非法、
+# last_sequence_by_chain 不是对象）一律 InvalidInputError；结构成立但游标取值
+# 非法（游标非非负整数、链标识非非空字符串、游标超过该链输入最大 sequence）
+# 为 CheckpointError。
+#
+# 旧版 {"last_sequence": N} 检查点仍可读：单 chain_id 输入把它解释为该链游标，
+# 成功后升级为 v2；多 chain_id 输入无法确定归属，抛 CheckpointError。
+@dataclass
+class _Checkpoint:
+    """解析后的检查点。
+
+    legacy 为 True 表示读到旧版 last_sequence（其值记录在 legacy_value，
+    chains 为空）；为 False 表示已是 v2，游标位于 chains。
+    """
+
+    chains: dict[str, int]
+    legacy: bool = False
+    legacy_value: Optional[int] = None
+
+
+def _checkpoint_invalid(message: str) -> InvalidInputError:
+    return InvalidInputError(f"checkpoint: {message}")
+
+
+def _parse_v2_checkpoint(data: Any) -> dict[str, int]:
+    """结构校验 v2 检查点。
+
+    结构性问题抛 InvalidInputError：非对象、未知/缺失字段、schema_version
+    不是整数 2、last_sequence_by_chain 不是对象，或任何位置出现 null/数组。
+    语义问题抛 CheckpointError：链标识为空字符串、游标既非 null/数组又不是
+    非负整数（负数、浮点、字符串、布尔等）。游标是否超过输入最大值由
+    :func:`_resolve_checkpoint` 在获知输入后判定。
+    """
+    if not isinstance(data, dict):
+        raise _checkpoint_invalid("must be a JSON object")
+
+    allowed = {"schema_version", "last_sequence_by_chain"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise _checkpoint_invalid(
+            f"unknown field(s): {', '.join(sorted(unknown))}"
+        )
+    if "schema_version" not in data:
+        raise _checkpoint_invalid("missing schema_version")
+    if "last_sequence_by_chain" not in data:
+        raise _checkpoint_invalid("missing last_sequence_by_chain")
+
+    version = data["schema_version"]
+    # null、数组或任何非整数（含错误版本号）都属结构非法。
+    if not _is_int(version):
+        raise _checkpoint_invalid("schema_version must be an integer")
+    if version != SCHEMA_VERSION:
+        raise _checkpoint_invalid(
+            f"unsupported schema_version {version}; expected {SCHEMA_VERSION}"
+        )
+
+    mapping = data["last_sequence_by_chain"]
+    # null 或数组（而非对象）属结构非法。
+    if not isinstance(mapping, dict):
+        raise _checkpoint_invalid("last_sequence_by_chain must be an object")
+
+    chains: dict[str, int] = {}
+    for chain, value in mapping.items():
+        if not isinstance(chain, str) or not chain:
+            # JSON 对象键恒为字符串，但空字符串链标识不合法。
+            raise CheckpointError(
+                "checkpoint chain identifier must be a non-empty string"
+            )
+        # null/数组在检查点中一律属结构非法（InvalidInputError）。
+        if value is None or isinstance(value, list):
+            kind = "null" if value is None else "an array"
+            raise _checkpoint_invalid(
+                f"cursor for chain {chain!r} must not be {kind}"
+            )
+        if not _is_int(value) or value < 0:
+            # 负数、浮点、字符串、布尔、对象等“不是非负整数”的取值属语义
+            # 非法（CheckpointError）。
+            raise CheckpointError(
+                f"checkpoint cursor for chain {chain!r} must be a non-negative "
+                "integer"
+            )
+        chains[chain] = value
+    return chains
+
+
+def load_checkpoint(path: PathLike) -> Optional[_Checkpoint]:
+    """读取检查点；文件不存在返回 None（首次处理）。
+
+    返回 v2 游标映射，或包装旧版 last_sequence 的遗留检查点。
+    """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             text = handle.read()
@@ -403,34 +511,71 @@ def load_checkpoint(path: PathLike) -> Optional[int]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise InvalidInputError(
-            f"checkpoint is not valid JSON: {exc.msg}"
-        ) from exc
+        raise _checkpoint_invalid(f"is not valid JSON: {exc.msg}") from exc
 
-    if not isinstance(data, dict) or "last_sequence" not in data:
-        raise InvalidInputError(
-            "checkpoint must be a JSON object containing last_sequence"
-        )
+    if not isinstance(data, dict):
+        raise _checkpoint_invalid("must be a JSON object")
 
-    last_sequence = data["last_sequence"]
-    if not _is_int(last_sequence):
-        # 布尔、浮点、字符串、null 都算“非整数”。
-        raise CheckpointError("checkpoint last_sequence must be an integer")
-    if last_sequence < 0:
-        raise CheckpointError("checkpoint last_sequence must not be negative")
-    return last_sequence
+    # 旧版检查点：只允许 last_sequence 一个字段。
+    if "schema_version" not in data:
+        unknown = set(data) - {"last_sequence"}
+        if unknown or "last_sequence" not in data:
+            raise _checkpoint_invalid(
+                "must contain schema_version and last_sequence_by_chain"
+            )
+        last_sequence = data["last_sequence"]
+        if not _is_int(last_sequence):
+            # 布尔、浮点、字符串、null 都算“非整数”。
+            raise CheckpointError("checkpoint last_sequence must be an integer")
+        if last_sequence < 0:
+            raise CheckpointError("checkpoint last_sequence must not be negative")
+        return _Checkpoint(chains={}, legacy=True, legacy_value=last_sequence)
+
+    chains = _parse_v2_checkpoint(data)
+    return _Checkpoint(chains=chains, legacy=False)
 
 
-def _validate_against_input(last_sequence: int, events: list[dict]) -> None:
-    if not events:
-        # 空流中，非负检查点不可能超过其最大值：留作成功空操作。
-        return
-    max_sequence = max(event["sequence"] for event in events)
-    if last_sequence > max_sequence:
-        raise CheckpointError(
-            f"checkpoint last_sequence {last_sequence} exceeds input maximum "
-            f"sequence {max_sequence}"
-        )
+def _resolve_checkpoint(
+    checkpoint: Optional[_Checkpoint], events: list[dict]
+) -> dict[str, int]:
+    """把解析结果落实为按链游标，并做跨输入一致性检查。
+
+    * 无检查点（首次处理）：空映射，各链均从第一条开始。
+    * v2：直接采用；某链游标超过该链输入最大 sequence 抛 CheckpointError。
+    * 旧版：仅当输入恰含一个 chain_id 时可归属；多链输入抛 CheckpointError。
+      缺失链从第一条开始（游标取 -1 语义由调用方以“不在映射中”表达）。
+    """
+    if checkpoint is None:
+        return {}
+
+    chains = checkpoint.chains
+
+    if checkpoint.legacy:
+        chain_ids = {event["chain_id"] for event in events}
+        if len(chain_ids) > 1:
+            raise CheckpointError(
+                "legacy last_sequence checkpoint cannot resume a multi-chain "
+                "input: chain ownership is ambiguous"
+            )
+        if len(chain_ids) == 1:
+            # 旧值已在加载时校验为非负整数；归属到唯一链。
+            chains = {next(iter(chain_ids)): checkpoint.legacy_value}
+        # 空输入（零链）无可归属，也无事件可处理：留作成功空操作。
+
+    max_by_chain: dict[str, int] = {}
+    for event in events:
+        chain = event["chain_id"]
+        sequence = event["sequence"]
+        if chain not in max_by_chain or sequence > max_by_chain[chain]:
+            max_by_chain[chain] = sequence
+
+    for chain, cursor in chains.items():
+        if chain in max_by_chain and cursor > max_by_chain[chain]:
+            raise CheckpointError(
+                f"checkpoint cursor {cursor} for chain {chain!r} exceeds input "
+                f"maximum sequence {max_by_chain[chain]}"
+            )
+    return chains
 
 
 # --------------------------------------------------------------------------- #
@@ -492,15 +637,21 @@ def _read_report_rows(path: PathLike) -> list[dict]:
     return rows
 
 
+def _report_identity(row: dict) -> tuple[Any, Any]:
+    """报告行的去重身份：(chain_id, sequence)。"""
+    return (row.get("chain_id"), row.get("sequence"))
+
+
 def _publish_resumed(path: PathLike, reports: list[dict]) -> None:
     """向累积报告追加新行，且绝不重复输出。
 
-    按 sequence 去重使发布幂等：即便上一次已写报告却在推进检查点前崩溃，
-    重跑会选中同样的事件，但不会二次写出。
+    按 (chain_id, sequence) 去重使发布幂等：即便上一次已写报告却在推进检查
+    点前崩溃，重跑会选中同样的事件，但不会二次写出。不同链复用同一 sequence
+    不会相互覆盖。
     """
     existing = _read_report_rows(path)
-    known = {row.get("sequence") for row in existing}
-    fresh = [row for row in reports if row["sequence"] not in known]
+    known = {_report_identity(row) for row in existing}
+    fresh = [row for row in reports if _report_identity(row) not in known]
     if not fresh and existing:
         return
     _atomic_write(path, _render_reports(existing + fresh))
@@ -509,33 +660,43 @@ def _publish_resumed(path: PathLike, reports: list[dict]) -> None:
 # --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
+def _render_checkpoint(cursors: dict[str, int]) -> str:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "last_sequence_by_chain": dict(sorted(cursors.items())),
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+
+
 def watch(
     input_path: PathLike,
     checkpoint: Optional[PathLike] = None,
     output_path: Optional[PathLike] = None,
 ) -> list[dict]:
-    """运行监控并返回逐事件报告行。
+    """运行监控并返回逐事件报告行（按输入行序）。
 
+    一个输入可承载多个 chain_id；选择与续传身份为 (chain_id, sequence)。
     给定 output_path 时原子写 JSONL 报告；仅当所有被选中事件都验证成功后，
-    才原子推进 checkpoint（若给出）。
+    才原子推进 checkpoint（若给出），且各链只推进到本次成功处理的最大
+    sequence。
     """
     events = load_events(input_path)
 
-    last_sequence: Optional[int] = None
+    parsed_checkpoint: Optional[_Checkpoint] = None
     resuming = False
     if checkpoint is not None:
         # 仅当检查点文件确实存在时才续传；文件缺失视为全新开始，需要完整
         # （重新）发布输入，而不是并入可能已陈旧的报告。
         resuming = os.path.exists(checkpoint)
-        last_sequence = load_checkpoint(checkpoint)
+        parsed_checkpoint = load_checkpoint(checkpoint)
 
-    if last_sequence is None:
-        selected = list(events)
-    else:
-        _validate_against_input(last_sequence, events)
-        selected = [
-            event for event in events if event["sequence"] > last_sequence
-        ]
+    # 各链游标；映射中缺失的链（含检查点未记录的新链）从第一条开始。
+    cursors = _resolve_checkpoint(parsed_checkpoint, events)
+    selected = [
+        event
+        for event in events
+        if event["sequence"] > cursors.get(event["chain_id"], -1)
+    ]
 
     reports: list[dict] = []
     for event in selected:
@@ -543,8 +704,8 @@ def watch(
         reports.append(build_report(event))
 
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
-    # 事件；续传时累积发布按 sequence 去重，因此即便重选也不会写两次。全新
-    # 开始总是写一份完整报告，覆盖输出路径上的陈旧文件。
+    # 事件；续传时累积发布按 (chain_id, sequence) 去重，因此即便重选也不会
+    # 写两次。全新开始总是写一份完整报告，覆盖输出路径上的陈旧文件。
     if output_path is not None:
         if resuming:
             _publish_resumed(output_path, reports)
@@ -552,12 +713,14 @@ def watch(
             _atomic_write(output_path, _render_reports(reports))
 
     if checkpoint is not None and selected:
-        new_last = max(event["sequence"] for event in selected)
-        _atomic_write(
-            checkpoint,
-            json.dumps({"last_sequence": new_last}, separators=(",", ":"))
-            + "\n",
-        )
+        new_cursors = dict(cursors)
+        for event in selected:
+            chain = event["chain_id"]
+            sequence = event["sequence"]
+            if sequence > new_cursors.get(chain, -1):
+                new_cursors[chain] = sequence
+        # 旧版 last_sequence 检查点在此随单链成功处理一并升级为 v2。
+        _atomic_write(checkpoint, _render_checkpoint(new_cursors))
 
     return reports
 
