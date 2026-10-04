@@ -2418,3 +2418,372 @@ def test_cli_first_run_writes_v3_checkpoint(workspace):
         "processed_lines",
         "input_prefix_sha256",
     }
+
+
+# ---------------------------------------------------------------------------
+# Sequence continuity inventory: --continuity-output
+# --------------------------------------------------------------------------- #
+
+
+CONTINUITY_FIELDS = {
+    "chain_id",
+    "event_count",
+    "min_sequence",
+    "max_sequence",
+    "missing_ranges",
+    "missing_count",
+}
+
+
+def read_continuity(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def run_with_continuity(workspace, **kwargs):
+    kwargs.setdefault("continuity_output", workspace["continuity"])
+    return run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        **kwargs,
+    )
+
+
+@pytest.fixture()
+def continuity_workspace(workspace):
+    workspace["continuity"] = workspace["input"].parent / "continuity.jsonl"
+    return workspace
+
+
+def test_continuity_rows_list_missing_ranges_as_closed_intervals(
+    continuity_workspace,
+):
+    # Sequences arrive out of line order: 7, 1, 4, 3 -> sorted 1,3,4,7 with
+    # gaps [2,2] and [5,6].
+    events = [
+        chain_event("chain-a", 7, "A7", 1000),
+        chain_event("chain-a", 1, "A1", 2000),
+        chain_event("chain-a", 4, "A4", 3000),
+        chain_event("chain-a", 3, "A3", 4000),
+    ]
+    write_events(continuity_workspace["input"], events)
+
+    run_with_continuity(continuity_workspace)
+
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 4,
+            "min_sequence": 1,
+            "max_sequence": 7,
+            "missing_ranges": [
+                {"start": 2, "end": 2},
+                {"start": 5, "end": 6},
+            ],
+            "missing_count": 3,
+        }
+    ]
+    assert set(rows[0]) == CONTINUITY_FIELDS
+
+
+def test_continuity_single_value_and_continuous_runs_have_no_gaps(
+    continuity_workspace,
+):
+    events = [
+        chain_event("chain-a", 5, "A5", 1000),
+        chain_event("chain-b", 0, "B0", 2000),
+        chain_event("chain-b", 1, "B1", 3000),
+        chain_event("chain-b", 2, "B2", 4000),
+    ]
+    write_events(continuity_workspace["input"], events)
+
+    run_with_continuity(continuity_workspace)
+
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 1,
+            "min_sequence": 5,
+            "max_sequence": 5,
+            "missing_ranges": [],
+            "missing_count": 0,
+        },
+        {
+            "chain_id": "chain-b",
+            "event_count": 3,
+            # Sequences may start at any non-negative value; nothing below the
+            # minimum is counted as a gap.
+            "min_sequence": 0,
+            "max_sequence": 2,
+            "missing_ranges": [],
+            "missing_count": 0,
+        },
+    ]
+
+
+def test_continuity_rows_ordered_by_first_appearance_with_interleaved_chains(
+    continuity_workspace,
+):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-b", 1, "B1", 2000),
+        chain_event("chain-x", 1, "X1", 3000),
+        chain_event("chain-a", 4, "A4", 4000),
+        chain_event("chain-b", 3, "B3", 5000),
+        chain_event("chain-x", 2, "X2", 6000),
+    ]
+    write_events(continuity_workspace["input"], events)
+
+    run_with_continuity(continuity_workspace)
+
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert [row["chain_id"] for row in rows] == [
+        "chain-a",
+        "chain-b",
+        "chain-x",
+    ]
+    by_chain = {row["chain_id"]: row for row in rows}
+    # Chains reuse sequences independently: each chain's gap is its own.
+    assert by_chain["chain-a"]["missing_ranges"] == [
+        {"start": 2, "end": 3}
+    ]
+    assert by_chain["chain-a"]["missing_count"] == 2
+    assert by_chain["chain-b"]["missing_ranges"] == [
+        {"start": 2, "end": 2}
+    ]
+    assert by_chain["chain-b"]["missing_count"] == 1
+    assert by_chain["chain-x"]["missing_ranges"] == []
+    assert by_chain["chain-x"]["missing_count"] == 0
+
+
+def test_continuity_empty_input_is_an_empty_file(continuity_workspace):
+    continuity_workspace["input"].write_text("", encoding="utf-8")
+
+    run_with_continuity(continuity_workspace)
+
+    assert continuity_workspace["continuity"].read_text(encoding="utf-8") == ""
+
+
+def test_continuity_covers_whole_input_not_just_post_cursor_events(
+    continuity_workspace,
+):
+    first_batch = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 3, "A3", 2000),
+    ]
+    write_events(continuity_workspace["input"], first_batch)
+    run_with_continuity(continuity_workspace)
+
+    second_batch = first_batch + [
+        chain_event("chain-a", 6, "A6", 3000),
+        chain_event("chain-b", 10, "B10", 4000),
+        chain_event("chain-b", 12, "B12", 5000),
+    ]
+    write_events(continuity_workspace["input"], second_batch)
+    reports = run_with_continuity(continuity_workspace)
+
+    # Only post-cursor events produced report rows ...
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 6),
+        ("chain-b", 10),
+        ("chain-b", 12),
+    ]
+    # ... but the inventory spans the entire current input, gaps included.
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "min_sequence": 1,
+            "max_sequence": 6,
+            "missing_ranges": [
+                {"start": 2, "end": 2},
+                {"start": 4, "end": 5},
+            ],
+            "missing_count": 3,
+        },
+        {
+            "chain_id": "chain-b",
+            "event_count": 2,
+            "min_sequence": 10,
+            "max_sequence": 12,
+            "missing_ranges": [{"start": 11, "end": 11}],
+            "missing_count": 1,
+        },
+    ]
+
+
+def test_continuity_rerun_is_identical(continuity_workspace):
+    write_events(continuity_workspace["input"], interlocked_events())
+    run_with_continuity(continuity_workspace)
+    first = continuity_workspace["continuity"].read_text(encoding="utf-8")
+
+    second_reports = run_with_continuity(continuity_workspace)
+
+    assert second_reports == []
+    assert continuity_workspace["continuity"].read_text(encoding="utf-8") == first
+
+
+def test_continuity_is_atomically_replaced_not_appended(continuity_workspace):
+    first_batch = [chain_event("chain-a", 1, "A1", 1000)]
+    write_events(continuity_workspace["input"], first_batch)
+    run_with_continuity(continuity_workspace)
+
+    second_batch = first_batch + [chain_event("chain-a", 2, "A2", 2000)]
+    write_events(continuity_workspace["input"], second_batch)
+    run_with_continuity(continuity_workspace)
+
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert [(row["chain_id"], row["event_count"]) for row in rows] == [
+        ("chain-a", 2)
+    ]
+
+
+def test_continuity_failed_proof_still_occupies_sequence_in_isolation(
+    continuity_workspace,
+):
+    events = [
+        isolated_event("chain-a", 1, "A1", 1000),
+        isolated_event("chain-a", 2, "A2", 2000, failing=True),
+        isolated_event("chain-a", 4, "A4", 3000),
+    ]
+    write_events(continuity_workspace["input"], events)
+
+    run_with_continuity(continuity_workspace, tolerate_failures=True)
+
+    rows = read_continuity(continuity_workspace["continuity"])
+    # The failed seq 2 is present; the only missing value between 1 and 4 is 3.
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "min_sequence": 1,
+            "max_sequence": 4,
+            "missing_ranges": [{"start": 3, "end": 3}],
+            "missing_count": 1,
+        }
+    ]
+
+
+def test_continuity_strict_failure_raises_and_leaves_existing_file_untouched(
+    continuity_workspace,
+):
+    write_events(continuity_workspace["input"], [chain_event("chain-a", 1, "A1", 1000)])
+    run_with_continuity(continuity_workspace)
+    before = continuity_workspace["continuity"].read_text(encoding="utf-8")
+
+    write_events(
+        continuity_workspace["input"],
+        [
+            chain_event("chain-a", 1, "A1", 1000),
+            isolated_event("chain-a", 3, "A3", 2000, failing=True),
+        ],
+    )
+    with pytest.raises(ProofVerificationError):
+        run_with_continuity(continuity_workspace)
+
+    assert continuity_workspace["continuity"].read_text(encoding="utf-8") == before
+
+
+def test_continuity_invalid_input_writes_nothing(continuity_workspace):
+    continuity_workspace["input"].write_text("{not json\n", encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run_with_continuity(continuity_workspace)
+    assert not continuity_workspace["continuity"].exists()
+
+
+def test_continuity_checkpoint_error_writes_nothing(continuity_workspace):
+    write_events(continuity_workspace["input"], [make_event(sequence=1)])
+    continuity_workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 99}), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run_with_continuity(continuity_workspace)
+    assert not continuity_workspace["continuity"].exists()
+
+
+def test_continuity_unwritable_path_raises_oserror_after_publishing(
+    continuity_workspace,
+):
+    write_events(continuity_workspace["input"], [make_event()])
+    # A regular file where a directory is expected makes makedirs fail; the
+    # report and checkpoint are already safely published by then.
+    blocker = continuity_workspace["input"].parent / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    continuity_workspace["continuity"] = blocker / "continuity.jsonl"
+
+    with pytest.raises(OSError):
+        run_with_continuity(continuity_workspace)
+
+    assert continuity_workspace["output"].exists()
+    assert json.loads(
+        continuity_workspace["checkpoint"].read_text(encoding="utf-8")
+    )["schema_version"] == 3
+
+
+def test_without_continuity_output_no_file_is_created(continuity_workspace):
+    write_events(continuity_workspace["input"], [make_event()])
+    run(
+        continuity_workspace["input"],
+        continuity_workspace["checkpoint"],
+        continuity_workspace["output"],
+    )
+    assert not continuity_workspace["continuity"].exists()
+
+
+def test_cli_continuity_output_success(continuity_workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 4, "A4", 2000),
+    ]
+    write_events(continuity_workspace["input"], events)
+    result = run_cli(
+        "--input", str(continuity_workspace["input"]),
+        "--checkpoint", str(continuity_workspace["checkpoint"]),
+        "--output", str(continuity_workspace["output"]),
+        "--continuity-output", str(continuity_workspace["continuity"]),
+    )
+    assert result.returncode == 0, result.stderr
+    rows = read_continuity(continuity_workspace["continuity"])
+    assert rows[0]["missing_ranges"] == [{"start": 2, "end": 3}]
+    assert rows[0]["missing_count"] == 2
+
+
+def test_cli_continuity_output_empty_input_exits_zero_with_empty_file(
+    continuity_workspace,
+):
+    continuity_workspace["input"].write_text("", encoding="utf-8")
+    result = run_cli(
+        "--input", str(continuity_workspace["input"]),
+        "--checkpoint", str(continuity_workspace["checkpoint"]),
+        "--output", str(continuity_workspace["output"]),
+        "--continuity-output", str(continuity_workspace["continuity"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert continuity_workspace["continuity"].read_text(encoding="utf-8") == ""
+
+
+def test_cli_continuity_unwritable_path_is_fixed_json_oserror_nonzero(
+    continuity_workspace,
+):
+    write_events(continuity_workspace["input"], [make_event()])
+    blocker = continuity_workspace["input"].parent / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    result = run_cli(
+        "--input", str(continuity_workspace["input"]),
+        "--checkpoint", str(continuity_workspace["checkpoint"]),
+        "--output", str(continuity_workspace["output"]),
+        "--continuity-output", str(blocker / "continuity.jsonl"),
+    )
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    # OSError subclasses are reported under their concrete class name.
+    assert issubclass(getattr(__import__("builtins"), payload["error"]), OSError)
+    # The main outputs were published before the continuity write failed.
+    assert continuity_workspace["output"].exists()
+    assert continuity_workspace["checkpoint"].exists()

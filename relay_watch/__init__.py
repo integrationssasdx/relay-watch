@@ -22,13 +22,21 @@ last_sequence 检查点仍按原规则读取，仅在确有新事件完成后升
 推进检查点。结构性输入错误与检查点错误在两种模式下都直接抛出、不写报告、不
 推进检查点。
 
+可选的序列连续性盘点（``run``/``watch`` 的 ``continuity_output``，CLI 的
+``--continuity-output``）仅在整批成功（报告与检查点安全发布）后原子替换一份
+UTF-8 JSONL：每条 chain_id 一行并按该链在输入中首次出现排序，字段为
+chain_id、event_count、min_sequence、max_sequence、missing_ranges、
+missing_count；盘点覆盖整份当前输入而非游标之后，最小值之前不算缺口，空输入
+写出空文件。该文件不参与游标，也不改变报告 JSONL 字段；省略时其余行为完全
+不变。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
-  tolerate_failures=False)`` -> list[dict]
+  tolerate_failures=False, continuity_output=None)`` -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
-  [--tolerate-failures [{true,false}]]``；
+  [--tolerate-failures [{true,false}]] [--continuity-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

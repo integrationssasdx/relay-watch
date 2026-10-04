@@ -10,7 +10,7 @@
 
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
-输入支持多个 chain_id；可选的逐事件失败隔离。
+输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点。
 
 ## 严格模式与失败隔离
 
@@ -44,6 +44,31 @@
 - 续传与报告去重身份为 `(chain_id, sequence)`：同一链内重复 `sequence`
   抛 `InvalidInputError`，不同链复用同一 `sequence` 合法且互不覆盖。
 - 报告行在单链字段基础上增加 `chain_id`，其余字段与数值口径不变。
+
+## 序列连续性盘点
+
+传入 `--continuity-output PATH`（模块 API 为 `run(..., continuity_output=PATH)`）
+时，仅在整批成功——报告与检查点均已安全发布——之后原子替换该路径上的一份
+UTF-8 JSONL。省略该参数时不生成文件，报告、检查点、异常与退出码均不变。
+
+- 盘点覆盖**整份当前输入**中结构合法的事件，而非续传游标之后的事件；因此
+  续传、追加输入与重复执行的结果一致。该文件不参与游标，也不改变报告
+  JSONL 的字段。
+- 每条 `chain_id` 一行，按该链在输入中**首次出现**的顺序排列；不同链复用
+  同一 `sequence` 互不影响。
+- 每行字段：
+  - `chain_id`：链标识；
+  - `event_count`：该链结构合法事件数；
+  - `min_sequence` / `max_sequence`：已出现的最小/最大 `sequence`；
+  - `missing_ranges`：相邻已出现 `sequence` 之间的空缺，升序排列，每个区间
+    为 `{"start": N, "end": M}` 的**闭区间**（含两端）；
+  - `missing_count`：缺失 `sequence` 总数。
+- `sequence` 可从任意非负值开始，最小值之前不算缺口；单值或完全连续时
+  `missing_ranges` 为空、`missing_count` 为 0；空输入原子替换为空文件。
+- 隔离模式（`--tolerate-failures true`）下证明失败的事件仍占有其
+  `sequence`；严格模式下证明失败仍直接抛 `ProofVerificationError`，盘点文件
+  不写出。`InvalidInputError`、`CheckpointError` 的既有无写入语义不变；
+  盘点路径不可写沿用 CLI 的 OSError JSON 错误与非零退出。
 
 ## 检查点
 

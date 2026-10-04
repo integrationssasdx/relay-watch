@@ -24,6 +24,14 @@ InvalidInputError），不同链可复用同一 sequence；各链事件可交错
 不阻断后续事件；成功与失败都算已处理并推进检查点。结构性输入/检查点错误在
 两种模式下都直接抛出。
 
+可选的序列连续性盘点（``continuity_output``）：整批成功（报告与检查点均
+安全发布）后原子写出一份 UTF-8 JSONL，每条 chain_id 一行并按该链在输入中
+首次出现的顺序排列，字段为 chain_id、event_count、min_sequence、
+max_sequence、missing_ranges、missing_count。盘点覆盖整份当前输入中结构
+合法的事件，与续传游标无关：sequence 可从任意非负值开始，最小值之前不算
+缺口，missing_ranges 升序列出相邻已出现 sequence 之间的闭区间空缺。隔离
+模式下证明失败的事件同样占有其 sequence。空输入原子替换为空文件。
+
 检查点当前为 schema_version 3：除按链游标外，还记录 ``processed_lines``
 （已读取且结构有效的 JSONL 物理行数）与 ``input_prefix_sha256``（首字节到
 第 processed_lines 行行末的原始 UTF-8 字节 SHA-256，64 位小写十六进制，
@@ -878,6 +886,56 @@ def _publish_resumed(path: PathLike, reports: list[dict]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 序列连续性盘点
+# --------------------------------------------------------------------------- #
+def _continuity_rows(events: list[dict]) -> list[dict]:
+    """按链盘点整个输入（与续传游标无关）的 sequence 连续性。
+
+    链按其事件在输入中首次出现的顺序排列；event_count 统计该链结构合法
+    事件数，min/max_sequence 取已出现值。missing_ranges 升序列出相邻已出现
+    sequence 之间的闭区间空缺（含 start 与 end）：sequence 可从任意非负值
+    开始，最小值之前不算缺口；单值或连续时为空，missing_count 为缺失总数。
+    """
+    order: list[str] = []
+    sequences_by_chain: dict[str, list[int]] = {}
+    for event in events:
+        chain = event["chain_id"]
+        if chain not in sequences_by_chain:
+            sequences_by_chain[chain] = []
+            order.append(chain)
+        sequences_by_chain[chain].append(event["sequence"])
+
+    rows: list[dict] = []
+    for chain in order:
+        sequences = sorted(sequences_by_chain[chain])
+        missing_ranges: list[dict] = []
+        missing_count = 0
+        for low, high in zip(sequences, sequences[1:]):
+            gap = high - low - 1
+            if gap > 0:
+                missing_ranges.append({"start": low + 1, "end": high - 1})
+                missing_count += gap
+        rows.append(
+            {
+                "chain_id": chain,
+                "event_count": len(sequences),
+                "min_sequence": sequences[0],
+                "max_sequence": sequences[-1],
+                "missing_ranges": missing_ranges,
+                "missing_count": missing_count,
+            }
+        )
+    return rows
+
+
+def _render_continuity(rows: list[dict]) -> str:
+    return "".join(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for row in rows
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -897,6 +955,7 @@ def watch(
     checkpoint: Optional[PathLike] = None,
     output_path: Optional[PathLike] = None,
     tolerate_failures: bool = False,
+    continuity_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -918,6 +977,11 @@ def watch(
     ``proof_status="failed"`` 行（携带 error_type/error_message）；成功与失败
     都算“已处理”，同样推进检查点，同链后续事件不受先前失败影响。结构性输入
     错误与检查点错误在两种模式下都直接抛出，不写报告、不推进检查点。
+
+    给定 ``continuity_output`` 时，仅在报告与检查点都安全发布后，原子替换
+    该路径上的序列连续性盘点 JSONL（见模块说明）；盘点基于整份当前输入而非
+    游标之后，故续传、追加与重复执行结果一致。该文件不参与游标，写出失败
+    （如路径不可写）抛 OSError，此前已发布的报告与检查点保持有效。
     """
     events, data, lines = _load_input(input_path)
 
@@ -981,6 +1045,15 @@ def watch(
             checkpoint, _render_checkpoint(new_cursors, processed_lines, digest)
         )
 
+    if continuity_output is not None:
+        # 盘点在既有报告与检查点安全发布之后写出，整批成功才会走到这里：
+        # 严格模式证明失败已抛出，结构/检查点错误同样不会抵达此处。盘点覆盖
+        # 整份当前输入（而非仅被选事件），与游标无关，续传、追加或重复执行
+        # 结果一致；原子替换，绝不留下半成品。
+        _atomic_write(
+            continuity_output, _render_continuity(_continuity_rows(events))
+        )
+
     return reports
 
 
@@ -989,9 +1062,18 @@ def run(
     checkpoint: Optional[PathLike] = None,
     output: Optional[PathLike] = None,
     tolerate_failures: bool = False,
+    continuity_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
     ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）。
+    给出 ``continuity_output`` 时整批成功后原子写出序列连续性盘点 JSONL
+    （CLI 对应可选参数 ``--continuity-output``）；省略时其余行为不变。
     """
-    return watch(input, checkpoint, output, tolerate_failures)
+    return watch(
+        input,
+        checkpoint,
+        output,
+        tolerate_failures,
+        continuity_output,
+    )
