@@ -69,8 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="CP",
         help=(
-            "按链记录续传游标的检查点 JSON 文件（schema_version 2，"
-            "last_sequence_by_chain）；旧版 last_sequence 仍可读。"
+            "按链记录续传游标的检查点 JSON 文件（schema_version 3："
+            "last_sequence_by_chain、processed_lines、input_prefix_sha256）；"
+            "schema_version 2 与旧版 last_sequence 仍可读。"
             "文件缺失表示从头处理"
         ),
     )
