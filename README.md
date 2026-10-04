@@ -9,8 +9,8 @@
 ## 状态
 
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
-按检查点断点续传、原子 JSONL 报告；单个输入支持多个 chain_id；可选的逐
-事件失败隔离。
+按检查点断点续传（含输入前缀 SHA-256 完整性保护）、原子 JSONL 报告；单个
+输入支持多个 chain_id；可选的逐事件失败隔离。
 
 ## 严格模式与失败隔离
 
@@ -47,16 +47,28 @@
 
 ## 检查点
 
-当前为 schema_version 2：
+当前为 schema_version 3：
 
 ```json
-{"schema_version":2,"last_sequence_by_chain":{"chain-a":3,"chain-b":7}}
+{"schema_version":3,"last_sequence_by_chain":{"chain-a":3,"chain-b":7},"processed_lines":12,"input_prefix_sha256":"…"}
 ```
 
-- 各链只推进本次已处理的最大 `sequence`（严格模式下即成功处理；隔离模式下
-  成功与失败都算已处理）；缺失链从第一条开始。
-- 旧版 `{"last_sequence": N}` 仍可读：单链输入将其解释为该链游标，成功后
-  升级为 v2；多链输入因归属不明抛 `CheckpointError`。
+- `last_sequence_by_chain` 记录各链已处理的最大 `sequence`；各链只推进本次
+  已处理的最大 `sequence`（严格模式下即成功处理；隔离模式下成功与失败都算
+  已处理），缺失链从第一条开始，未选中事件的链游标保留不动。
+- `processed_lines` 是已读取且结构有效的 JSONL 物理行数（空白行不计）。
+- `input_prefix_sha256` 是输入首字节到第 `processed_lines` 行行末原始
+  UTF-8 字节的 SHA-256，写作 64 位小写十六进制；末行无换行不补。
+- 续传时前 `processed_lines` 行须与摘要逐字节一致，其后仅可追加完整
+  JSONL 行；一致后按 `(chain_id, sequence)` 选择事件。摘要不一致、
+  `processed_lines` 非正整数或超过输入行数、某链游标与前缀内最大 sequence
+  不一致，抛 `CheckpointError`——历史事件即使 `(chain_id, sequence)` 不变，
+  只要字节被改写也不会被游标静默跳过。
+- v3 字段缺失、出现未知字段、字段类型错误，或摘要不是 64 位小写十六进制，
+  抛 `InvalidInputError`。
+- schema_version 2 与旧版 `{"last_sequence": N}` 仍按当前游标规则读取
+  （旧版仅限单链输入，多链归属不明抛 `CheckpointError`），但不伪造摘要：
+  只在确有新事件产生结果后升级为 v3，无新事件保持原样、空操作成功。
 - 游标非非负整数、链标识非非空字符串，或某链游标超过该链输入最大
   `sequence`，抛 `CheckpointError`；结构无法解析、缺字段、出现 `null`、
   数组或未知字段，抛 `InvalidInputError`。

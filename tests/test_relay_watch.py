@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -441,12 +442,10 @@ def test_checkpoint_resume_processes_only_greater_sequences(workspace):
     )
     reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
     assert [r["sequence"] for r in reports] == [2, 3]
-    # Legacy single-chain checkpoint is upgraded to the v2 per-chain shape.
+    # Legacy single-chain checkpoint is upgraded straight to the v3 shape
+    # (cursors plus processed-line count and input prefix digest).
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == {
-        "schema_version": 2,
-        "last_sequence_by_chain": {"chain-7": 3},
-    }
+    assert checkpoint == v3_checkpoint({"chain-7": 3}, 3, workspace["input"])
 
 
 def test_resume_is_idempotent_no_duplicate_output(workspace):
@@ -681,6 +680,31 @@ def v2_checkpoint(mapping):
     return {"schema_version": 2, "last_sequence_by_chain": mapping}
 
 
+def input_prefix_digest(path, n):
+    """SHA-256 of the first n newline-terminated physical lines of path."""
+    data = path.read_bytes()
+    end = -1
+    for _ in range(n):
+        end = data.index(b"\n", end + 1)
+    return hashlib.sha256(data[: end + 1]).hexdigest()
+
+
+def v3_checkpoint(mapping, processed_lines, path):
+    return {
+        "schema_version": 3,
+        "last_sequence_by_chain": mapping,
+        "processed_lines": processed_lines,
+        "input_prefix_sha256": input_prefix_digest(path, processed_lines),
+    }
+
+
+def write_v3_checkpoint(path, mapping, processed_lines, input_path):
+    path.write_text(
+        json.dumps(v3_checkpoint(mapping, processed_lines, input_path)),
+        encoding="utf-8",
+    )
+
+
 def test_v2_resume_filters_per_chain_and_missing_chain_starts_from_first(
     workspace,
 ):
@@ -700,7 +724,9 @@ def test_v2_resume_filters_per_chain_and_missing_chain_starts_from_first(
         ("chain-b", 3),
     ]
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 3, "chain-b": 3})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 3, "chain-b": 3}, 6, workspace["input"]
+    )
 
 
 def test_v2_resume_advances_only_chains_with_selected_events(workspace):
@@ -717,7 +743,9 @@ def test_v2_resume_advances_only_chains_with_selected_events(workspace):
 
     assert {r["chain_id"] for r in reports} == {"chain-b"}
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 3, "chain-b": 3})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 3, "chain-b": 3}, 6, workspace["input"]
+    )
 
 
 def test_v2_resume_rerun_is_a_noop(workspace):
@@ -798,7 +826,9 @@ def test_v2_resume_appends_only_higher_sequences(workspace):
         ("chain-b", 2),
     ]
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 2, "chain-b": 2})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 2, "chain-b": 2}, 4, workspace["input"]
+    )
 
 
 def test_shared_sequence_across_chains_does_not_dedupe_output(workspace):
@@ -853,7 +883,9 @@ def test_resume_introducing_a_new_chain_appends_its_events(workspace):
         ("chain-b", 1)
     ]
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 1, "chain-b": 1})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 1, "chain-b": 1}, 2, workspace["input"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1029,8 +1061,12 @@ def test_v2_checkpoint_cursor_for_unmentioned_chain_is_allowed(workspace):
     assert [(r["chain_id"], r["sequence"]) for r in reports] == [
         ("chain-a", 2)
     ]
+    # The v2 cursor for an unmentioned chain is carried into the v3 checkpoint
+    # untouched; only chains present in the processed prefix are constrained.
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 2, "chain-other": 99})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 2, "chain-other": 99}, 1, workspace["input"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1088,7 +1124,7 @@ def test_cli_multichain_success_silent_stdout(workspace):
         for line in workspace["output"].read_text(encoding="utf-8").splitlines()
     ]
     assert len(rows) == 6
-    assert json.loads(workspace["checkpoint"].read_text())["schema_version"] == 2
+    assert json.loads(workspace["checkpoint"].read_text())["schema_version"] == 3
 
 
 def test_cli_multichain_then_rerun_is_noop(workspace):
@@ -1282,7 +1318,7 @@ def test_tolerate_failures_advances_checkpoint_past_failed_events(workspace):
 
     # Success and failure both count as processed: cursor reaches sequence 3.
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 3})
+    assert checkpoint == v3_checkpoint({"chain-a": 3}, 3, workspace["input"])
 
     # Rerun selects nothing, including the previously failed row.
     second = run(
@@ -1363,8 +1399,8 @@ def test_all_events_failing_still_processes_and_advances(workspace):
 
     assert [r["proof_status"] for r in reports] == ["failed", "failed"]
     assert {r["error_type"] for r in reports} == {"ProofVerificationError"}
-    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
-        {"chain-a": 2}
+    assert json.loads(workspace["checkpoint"].read_text()) == v3_checkpoint(
+        {"chain-a": 2}, 2, workspace["input"]
     )
 
 
@@ -1403,7 +1439,9 @@ def test_tolerate_failures_multichain_isolation_and_per_chain_cursors(workspace)
     ]
     checkpoint = json.loads(workspace["checkpoint"].read_text())
     # The failed A2 still advances chain-a's cursor through 3.
-    assert checkpoint == v2_checkpoint({"chain-a": 3, "chain-b": 3})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 3, "chain-b": 3}, 6, workspace["input"]
+    )
 
 
 def test_tolerate_failures_same_sequence_on_different_chains_independent(workspace):
@@ -1425,7 +1463,9 @@ def test_tolerate_failures_same_sequence_on_different_chains_independent(workspa
         ("chain-b", 5, "verified"),
     ]
     checkpoint = json.loads(workspace["checkpoint"].read_text())
-    assert checkpoint == v2_checkpoint({"chain-a": 5, "chain-b": 5})
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 5, "chain-b": 5}, 2, workspace["input"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1595,9 +1635,9 @@ def test_tolerate_failures_upgrades_legacy_single_chain_checkpoint(workspace):
     )
 
     assert [r["proof_status"] for r in reports] == ["verified", "failed"]
-    # A failed event still triggers the legacy -> v2 upgrade.
-    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
-        {"chain-7": 2}
+    # A failed event still triggers the legacy -> v3 upgrade.
+    assert json.loads(workspace["checkpoint"].read_text()) == v3_checkpoint(
+        {"chain-7": 2}, 2, workspace["input"]
     )
 
 
@@ -1649,8 +1689,8 @@ def test_cli_tolerate_failures_bare_flag_succeeds_with_failed_rows(workspace):
     failed = rows[1]
     assert failed["error_type"] == "ProofVerificationError"
     assert isinstance(failed["error_message"], str) and failed["error_message"]
-    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
-        {"chain-a": 3}
+    assert json.loads(workspace["checkpoint"].read_text()) == v3_checkpoint(
+        {"chain-a": 3}, 3, workspace["input"]
     )
 
 
@@ -1712,3 +1752,588 @@ def test_cli_tolerate_failures_invalid_value_is_fixed_json_exit_2(workspace):
     assert payload["error"] == "InvalidArgument"
     assert "true" in payload["message"] and "false" in payload["message"]
     assert not workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# v3 checkpoints: written shape and exact input-prefix digest
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_run_writes_v3_checkpoint_with_processed_lines_and_digest(workspace):
+    events = three_events()
+    write_events(workspace["input"], events)
+
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    raw = workspace["input"].read_bytes()
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == {
+        "schema_version": 3,
+        "last_sequence_by_chain": {"chain-7": 3},
+        "processed_lines": 3,
+        "input_prefix_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    # The digest is exactly 64 lowercase hex characters.
+    digest = checkpoint["input_prefix_sha256"]
+    assert len(digest) == 64 and digest == digest.lower()
+    int(digest, 16)
+
+
+def test_v3_digest_includes_raw_bytes_but_no_added_newline_on_last_line(workspace):
+    event = make_event()
+    # No trailing newline on the final (only) line.
+    workspace["input"].write_bytes(json.dumps(event).encode("utf-8"))
+
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    raw = workspace["input"].read_bytes()
+    assert not raw.endswith(b"\n")
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint["processed_lines"] == 1
+    # The digest covers the bytes as they are; no newline is invented.
+    assert checkpoint["input_prefix_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_v3_digest_covers_crlf_and_blank_lines_raw(workspace):
+    # Physical lines are counted as valid JSONL lines only (the blank line is
+    # skipped), while the digest is over the raw bytes, CRLF and blanks included.
+    first = json.dumps(three_events()[0])
+    second = json.dumps(three_events()[1])
+    raw = first.encode() + b"\r\n\r\n" + second.encode() + b"\r\n"
+    workspace["input"].write_bytes(raw)
+
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint["processed_lines"] == 2
+    assert checkpoint["input_prefix_sha256"] == hashlib.sha256(raw).hexdigest()
+
+    # Appending after the CRLF-terminated prefix resumes normally.
+    third = json.dumps(three_events()[2])
+    workspace["input"].write_bytes(raw + third.encode() + b"\r\n")
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [r["sequence"] for r in reports] == [3]
+    new_raw = workspace["input"].read_bytes()
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint["processed_lines"] == 3
+    assert checkpoint["input_prefix_sha256"] == hashlib.sha256(new_raw).hexdigest()
+
+
+def test_v3_resume_after_append_selects_only_new_events_and_advances(workspace):
+    first_batch = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-b", 1, "B1", 2000),
+    ]
+    write_events(workspace["input"], first_batch)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    second_batch = first_batch + [
+        chain_event("chain-a", 2, "A2", 3000),
+        chain_event("chain-b", 2, "B2", 4000),
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 2),
+        ("chain-b", 2),
+    ]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 2, "chain-b": 2}, 4, workspace["input"]
+    )
+    # Third run with the file untouched selects nothing and rewrites nothing.
+    cp_bytes = workspace["checkpoint"].read_bytes()
+    out_bytes = workspace["output"].read_bytes()
+    assert run(workspace["input"], workspace["checkpoint"], workspace["output"]) == []
+    assert workspace["checkpoint"].read_bytes() == cp_bytes
+    assert workspace["output"].read_bytes() == out_bytes
+
+
+# ---------------------------------------------------------------------------
+# v3 integrity: historical lines rewritten are never skipped by the cursor
+# ---------------------------------------------------------------------------
+
+
+def rewrite_line(path, index, mutate):
+    """Rewrite physical JSONL line `index`, keeping every other byte identical."""
+    data = path.read_bytes()
+    lines = data.split(b"\n")
+    event = json.loads(lines[index])
+    mutate(event)
+    lines[index] = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    path.write_bytes(b"\n".join(lines))
+
+
+def test_tampered_history_same_identity_is_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    output_before = workspace["output"].read_bytes()
+    cp_before = workspace["checkpoint"].read_bytes()
+
+    # Change an observed_at on an already-processed event; identity
+    # (chain_id, sequence) is unchanged, so a cursor alone would skip it.
+    rewrite_line(
+        workspace["input"], 0, lambda event: event.__setitem__("observed_at", 1002)
+    )
+
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert workspace["output"].read_bytes() == output_before
+    assert workspace["checkpoint"].read_bytes() == cp_before
+
+
+def test_tampered_history_proof_field_is_checkpoint_error(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000),
+    ]
+    write_events(workspace["input"], events)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # Rewrite the historical proof (same identity) into one that would fail.
+    rewrite_line(
+        workspace["input"],
+        0,
+        lambda event: event["proof"].__setitem__("quorum", 9),
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_tampered_history_rejected_even_under_tolerate_failures(workspace):
+    write_events(workspace["input"], interlocked_events())
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    rewrite_line(
+        workspace["input"], 2, lambda event: event.__setitem__("finalized_at", 9999)
+    )
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=True,
+        )
+
+
+def test_appending_plus_tampering_history_is_still_rejected(workspace):
+    first_batch = [chain_event("chain-a", 1, "A1", 1000)]
+    write_events(workspace["input"], first_batch)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # A new event is appended AND a historical byte changes: new work must not
+    # silently proceed over the rewritten prefix.
+    second_batch = first_batch + [chain_event("chain-a", 2, "A2", 2000)]
+    write_events(workspace["input"], second_batch)
+    rewrite_line(
+        workspace["input"], 0, lambda event: event.__setitem__("observed_at", 1003)
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_cli_digest_mismatch_is_fixed_json_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    output_before = workspace["output"].read_bytes()
+    rewrite_line(
+        workspace["input"], 0, lambda event: event.__setitem__("observed_at", 1004)
+    )
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "CheckpointError"
+    assert workspace["output"].read_bytes() == output_before
+
+
+# ---------------------------------------------------------------------------
+# v3 semantic validation -> CheckpointError
+# ---------------------------------------------------------------------------
+
+
+def write_v3_and_run(workspace, raw):
+    workspace["checkpoint"].write_text(json.dumps(raw), encoding="utf-8")
+    return run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_v3_processed_lines_above_line_count_is_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    raw = v3_checkpoint({"chain-a": 3, "chain-b": 3}, 6, workspace["input"])
+    raw["processed_lines"] = 7
+    with pytest.raises(CheckpointError):
+        write_v3_and_run(workspace, raw)
+
+
+def test_v3_truncated_input_is_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    write_v3_checkpoint(
+        workspace["checkpoint"],
+        {"chain-a": 3, "chain-b": 3},
+        6,
+        workspace["input"],
+    )
+    # File shrinks below the processed prefix.
+    write_events(workspace["input"], interlocked_events()[:2])
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_v3_cursor_below_prefix_maximum_is_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    # Prefix covers the first four lines (chain-a max 2, chain-b max 2); the
+    # honest digest makes this a pure cursor/prefix consistency failure.
+    raw = v3_checkpoint({"chain-a": 1, "chain-b": 2}, 4, workspace["input"])
+    with pytest.raises(CheckpointError):
+        write_v3_and_run(workspace, raw)
+
+
+def test_v3_cursor_above_prefix_maximum_but_within_input_is_checkpoint_error(
+    workspace,
+):
+    write_events(workspace["input"], interlocked_events())
+    # chain-a cursor 3 matches a sequence that exists *later* in the file
+    # (line 5), not inside the four-line prefix (whose chain-a max is 2).
+    raw = v3_checkpoint({"chain-a": 3, "chain-b": 2}, 4, workspace["input"])
+    with pytest.raises(CheckpointError):
+        write_v3_and_run(workspace, raw)
+
+
+def test_v3_missing_cursor_for_prefix_chain_is_checkpoint_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    # Prefix of four lines contains both chains; chain-b has no cursor at all.
+    raw = v3_checkpoint({"chain-a": 2}, 4, workspace["input"])
+    with pytest.raises(CheckpointError):
+        write_v3_and_run(workspace, raw)
+
+
+def test_v3_extra_cursor_for_chain_absent_from_prefix_is_allowed(workspace):
+    events = [chain_event("chain-a", 1, "A1", 1000)]
+    write_events(workspace["input"], events)
+    raw = v3_checkpoint({"chain-a": 1, "chain-z": 42}, 1, workspace["input"])
+    reports = write_v3_and_run(workspace, raw)
+    assert reports == []
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    # Rerun with nothing selected leaves the honest v3 checkpoint untouched,
+    # including the foreign chain's carried cursor.
+    assert checkpoint == raw
+
+
+def test_v3_gluing_onto_the_last_historical_line_is_checkpoint_error(workspace):
+    # First run ends without a trailing newline; the v3 prefix ends at EOF on a
+    # non-newline byte.
+    first = chain_event("chain-a", 1, "A1", 1000)
+    workspace["input"].write_bytes(json.dumps(first).encode("utf-8"))
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # Append by gluing a space onto the old last line (still parses to the same
+    # event) before adding the new event: the historical bytes changed, so this
+    # is rejected as a prefix-integrity failure rather than a clean append.
+    second = chain_event("chain-a", 2, "A2", 2000)
+    workspace["input"].write_bytes(
+        json.dumps(first).encode("utf-8")
+        + b" \n"
+        + json.dumps(second).encode("utf-8")
+        + b"\n"
+    )
+    with pytest.raises(CheckpointError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+# ---------------------------------------------------------------------------
+# v3 structural validation -> InvalidInputError
+# ---------------------------------------------------------------------------
+
+
+def honest_v3_raw(workspace):
+    write_events(workspace["input"], interlocked_events())
+    return v3_checkpoint(
+        {"chain-a": 3, "chain-b": 3}, 6, workspace["input"]
+    )
+
+
+def write_v3_and_expect_invalid(workspace, raw):
+    workspace["checkpoint"].write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_v3_missing_processed_lines_is_invalid(workspace):
+    raw = honest_v3_raw(workspace)
+    del raw["processed_lines"]
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+def test_v3_missing_digest_is_invalid(workspace):
+    raw = honest_v3_raw(workspace)
+    del raw["input_prefix_sha256"]
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+def test_v3_unknown_field_is_invalid(workspace):
+    raw = honest_v3_raw(workspace)
+    raw["extra"] = 1
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "6", True, False, None, [], [1]])
+def test_v3_processed_lines_type_must_be_positive_int(workspace, value):
+    raw = honest_v3_raw(workspace)
+    raw["processed_lines"] = value
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "A" * 64,            # uppercase hex rejected
+        "0" * 63,            # too short
+        "0" * 65,            # too long
+        "g" * 64,            # not hex
+        "0x" + "0" * 62,     # 0x prefix rejected
+        "ab cd" + "0" * 61,  # whitespace / wrong length
+        None,
+        123,
+        ["0" * 64],
+        {"digest": "0" * 64},
+    ],
+)
+def test_v3_digest_must_be_64_lowercase_hex(workspace, value):
+    raw = honest_v3_raw(workspace)
+    raw["input_prefix_sha256"] = value
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+def test_v3_wrong_schema_version_is_invalid(workspace):
+    raw = honest_v3_raw(workspace)
+    raw["schema_version"] = 4
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+def test_v3_null_schema_version_is_invalid(workspace):
+    raw = honest_v3_raw(workspace)
+    raw["schema_version"] = None
+    write_v3_and_expect_invalid(workspace, raw)
+
+
+def test_v3_malformed_json_is_invalid(workspace):
+    write_events(workspace["input"], interlocked_events())
+    workspace["checkpoint"].write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+
+def test_cli_v3_structural_error_is_invalid_input_error(workspace):
+    write_events(workspace["input"], interlocked_events())
+    raw = honest_v3_raw(workspace)
+    raw["input_prefix_sha256"] = "not-a-digest"
+    workspace["checkpoint"].write_text(json.dumps(raw), encoding="utf-8")
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "InvalidInputError"
+    assert not workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# v2 / legacy checkpoints: read under old rules, upgrade only on new results
+# ---------------------------------------------------------------------------
+
+
+def test_v2_checkpoint_no_new_events_is_unchanged_noop(workspace):
+    write_events(workspace["input"], interlocked_events())
+    v2 = v2_checkpoint({"chain-a": 3, "chain-b": 3})
+    workspace["checkpoint"].write_text(json.dumps(v2), encoding="utf-8")
+
+    assert run(workspace["input"], workspace["checkpoint"], workspace["output"]) == []
+    # No fabricated digest: the v2 document is left byte-for-byte untouched.
+    assert json.loads(workspace["checkpoint"].read_text()) == v2
+
+
+def test_v2_checkpoint_upgrades_to_v3_only_after_new_results(workspace):
+    events = interlocked_events()
+    write_events(workspace["input"], events[:4])
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 2, "chain-b": 2})),
+        encoding="utf-8",
+    )
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # Append the remaining two events; only this run upgrades to v3.
+    write_events(workspace["input"], events)
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 3),
+        ("chain-b", 3),
+    ]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 3, "chain-b": 3}, 6, workspace["input"]
+    )
+
+
+def test_v2_checkpoint_with_tolerate_failures_upgrades_on_failed_results(workspace):
+    events = [
+        isolated_event("chain-a", 1, "A1", 1000),
+        isolated_event("chain-a", 2, "A2", 2000, failing=True),
+    ]
+    write_events(workspace["input"], events[:1])
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 1})), encoding="utf-8"
+    )
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    # Nothing new -> stays v2.
+    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
+        {"chain-a": 1}
+    )
+
+    write_events(workspace["input"], events)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    assert json.loads(workspace["checkpoint"].read_text()) == v3_checkpoint(
+        {"chain-a": 2}, 2, workspace["input"]
+    )
+
+
+def test_v2_strict_failure_does_not_upgrade_or_write_report(workspace):
+    events = [
+        isolated_event("chain-a", 1, "A1", 1000),
+        isolated_event("chain-a", 2, "A2", 2000),
+        isolated_event("chain-a", 3, "A3", 3000, failing=True),
+    ]
+    write_events(workspace["input"], events[:2])
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-a": 2})), encoding="utf-8"
+    )
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # New event fails proof verification in strict mode: no result, no upgrade.
+    write_events(workspace["input"], events)
+    with pytest.raises(ProofVerificationError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert json.loads(workspace["checkpoint"].read_text()) == v2_checkpoint(
+        {"chain-a": 2}
+    )
+
+
+def test_legacy_checkpoint_no_new_events_stays_legacy(workspace):
+    write_events(workspace["input"], [make_event(sequence=2)])
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 2}), encoding="utf-8"
+    )
+    assert run(workspace["input"], workspace["checkpoint"], workspace["output"]) == []
+    assert json.loads(workspace["checkpoint"].read_text()) == {"last_sequence": 2}
+
+
+def test_legacy_checkpoint_upgrades_straight_to_v3_with_digest(workspace):
+    events = three_events()
+    write_events(workspace["input"], events[:2])
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": 2}), encoding="utf-8"
+    )
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    write_events(workspace["input"], events)
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [r["sequence"] for r in reports] == [3]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v3_checkpoint({"chain-7": 3}, 3, workspace["input"])
+
+
+# ---------------------------------------------------------------------------
+# v3 resume across multi-chain appends keeps report dedup and line order
+# ---------------------------------------------------------------------------
+
+
+def test_v3_multichain_append_new_chain_appends_in_input_order(workspace):
+    first_batch = [chain_event("chain-a", 1, "A1", 1000)]
+    write_events(workspace["input"], first_batch)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    second_batch = first_batch + [
+        chain_event("chain-a", 2, "A2", 3000),
+        chain_event("chain-b", 1, "B1", 2000),
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert [(r["chain_id"], r["sequence"]) for r in reports] == [
+        ("chain-a", 2),
+        ("chain-b", 1),
+    ]
+    rows = [
+        json.loads(line)
+        for line in workspace["output"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(r["chain_id"], r["sequence"]) for r in rows] == [
+        ("chain-a", 1),
+        ("chain-a", 2),
+        ("chain-b", 1),
+    ]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 2, "chain-b": 1}, 3, workspace["input"]
+    )
+
+
+def test_v3_strict_failure_on_new_events_keeps_report_and_checkpoint(workspace):
+    good = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-b", 1, "B1", 2000),
+    ]
+    write_events(workspace["input"], good)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    cp_before = workspace["checkpoint"].read_bytes()
+    out_before = workspace["output"].read_bytes()
+
+    # Append a new event whose proof fails; in strict mode nothing may move.
+    with_bad = good + [
+        chain_event(
+            "chain-a", 2, "A2", 3000, signatures=["0xaa11"], quorum=2
+        )
+    ]
+    write_events(workspace["input"], with_bad)
+    with pytest.raises(ProofVerificationError):
+        run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    # The prefix is intact (only appended), so the next tolerate-run still works;
+    # right now both artifacts remain exactly as they were.
+    assert workspace["checkpoint"].read_bytes() == cp_before
+    assert workspace["output"].read_bytes() == out_before
+
+    # Re-running in isolation mode processes the appended failure and advances.
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+    )
+    assert [r["proof_status"] for r in reports] == ["failed"]
+    checkpoint = json.loads(workspace["checkpoint"].read_text())
+    assert checkpoint == v3_checkpoint(
+        {"chain-a": 2, "chain-b": 1}, 3, workspace["input"]
+    )

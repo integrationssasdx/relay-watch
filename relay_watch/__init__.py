@@ -3,9 +3,14 @@
 该包校验 JSONL 事件携带的轻客户端证明、对各阶段延迟归因，并通过检查点支持
 断点续传。单个输入可承载多个 chain_id：续传与报告去重身份为
 (chain_id, sequence)，同一链内 sequence 唯一，不同链可复用同一 sequence；
-事件按输入行序处理与返回。检查点为 schema_version 2 的
-``{"schema_version": 2, "last_sequence_by_chain": {...}}``，旧版
-last_sequence 检查点仍可读（仅限单链输入，成功后升级）。
+事件按输入行序处理与返回。检查点为 schema_version 3 的
+``{"schema_version": 3, "last_sequence_by_chain": {...}, "processed_lines": N,
+"input_prefix_sha256": "..."}``：processed_lines 为已读取且结构有效的 JSONL
+物理行数，input_prefix_sha256 为首字节到该行行末原始 UTF-8 字节的摘要；
+续传时此前缀须逐字节复算一致、其后仅可追加完整 JSONL 行，且各链游标须等于
+前缀内最大 sequence，防止历史事件被改写后仍被游标跳过。schema_version 2
+与旧版 last_sequence 检查点仍可读（旧版仅限单链输入），只在确有新事件产生
+结果后升级为 v3，无新事件保持空操作。
 
 严格处理为默认：首个结构合法但证明失败的事件立即抛 ProofVerificationError，
 不写报告、不推进检查点。传入 ``tolerate_failures=True``（CLI：
