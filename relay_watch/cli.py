@@ -2,6 +2,7 @@
 
 relay-watch --input IN --checkpoint CP --output OUT
     [--continuity-output PATH] [--tolerate-failures [{true,false}]]
+    [--latency-thresholds PATH --latency-breach-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -105,12 +106,44 @@ def build_parser() -> argparse.ArgumentParser:
             "首个证明失败立即报错退出。裸用该标志等价于 true。"
         ),
     )
+    parser.add_argument(
+        "--latency-thresholds",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：延迟阈值 UTF-8 JSON 文件路径，对象仅含 proof_latency_ms、"
+            "relay_latency_ms、destination_latency_ms 三个非负整数毫秒字段。"
+            "必须与 --latency-breach-output 成对给出"
+        ),
+    )
+    parser.add_argument(
+        "--latency-breach-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：延迟越界清单输出路径（整批成功后最后原子替换的 UTF-8 "
+            "JSONL，字段为 event_id、chain_id、sequence、proof_status、"
+            "breached_stages、attribution、finalized_at；三个延迟字段仅在"
+            "严格大于 --latency-thresholds 同名阈值时列入）。必须与 "
+            "--latency-thresholds 成对给出；无越界或无新事件时写空文件"
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # 两个延迟越界参数必须成对：缺一即用法错误，按固定 JSON（InvalidArgument）
+    # 以退出码 2 报告，与 argparse 自身的参数错误同口径。
+    if (args.latency_thresholds is None) != (
+        args.latency_breach_output is None
+    ):
+        parser.error(
+            "--latency-thresholds and --latency-breach-output must be "
+            "given together"
+        )
 
     try:
         run(
@@ -119,6 +152,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.output,
             tolerate_failures=args.tolerate_failures,
             continuity_output=args.continuity_output,
+            latency_thresholds=args.latency_thresholds,
+            latency_breach_output=args.latency_breach_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

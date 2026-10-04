@@ -39,6 +39,17 @@ InvalidInputError），不同链可复用同一 sequence；各链事件可交错
 的最小/最大值，以及相邻 sequence 间空缺的升序闭区间与缺失总数。盘点覆盖
 整个当前输入而非游标之后，不参与游标，也不改报告字段；省略时行为与旧版
 完全一致。
+
+可选的延迟越界清单（``latency_thresholds`` 与 ``latency_breach_output``
+成对给出）在报告、检查点、连续性盘点均安全发布后最后原子写出：阈值文件为
+UTF-8 JSON 对象，仅含 proof_latency_ms、relay_latency_ms、
+destination_latency_ms 三个非负整数毫秒字段，不合规抛 InvalidInputError；
+按报告行序逐行查本次运行新产出的报告行，三个延迟字段仅在严格大于同名阈值
+时列入 breached_stages（顺序固定为 proof_latency_ms、relay_latency_ms、
+destination_latency_ms）。隔离模式下的失败报告行同样参与（proof_status 为
+failed）；严格模式的证明失败仍在发布前抛 ProofVerificationError，不写清单。
+无越界或无新事件时写空文件；任何领域错误都不写清单。省略这对参数时行为与
+旧版完全一致。
 """
 
 from __future__ import annotations
@@ -91,6 +102,14 @@ PROOF_FIELDS = (
 _SOURCE = "source"
 _RELAY = "relay"
 _DESTINATION = "destination"
+
+# 延迟阈值字段名，亦即越界清单 breached_stages 中使用的阶段名；顺序即清单
+# 中各越界阶段的固定列出顺序。
+LATENCY_THRESHOLD_FIELDS = (
+    "proof_latency_ms",
+    "relay_latency_ms",
+    "destination_latency_ms",
+)
 
 
 class RelayWatchError(Exception):
@@ -923,6 +942,99 @@ def _publish_resumed(path: PathLike, reports: list[dict]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 延迟越界清单
+# --------------------------------------------------------------------------- #
+def load_latency_thresholds(path: PathLike) -> dict[str, int]:
+    """读取并校验延迟阈值 JSON 对象。
+
+    文件必须是 UTF-8 JSON 对象，且恰好只含 proof_latency_ms、
+    relay_latency_ms、destination_latency_ms 三个字段，每个值为非负整数
+    毫秒（布尔、浮点、字符串、null、负数等一律拒绝）。无法解析或不合规都抛
+    InvalidInputError；文件无法打开等错误原样作为 OSError 子类传播，文件
+    存在但含非法 UTF-8 字节按不合规输入抛 InvalidInputError，由调用方沿用
+    统一的文件错误处理。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except UnicodeDecodeError as exc:
+        raise InvalidInputError(
+            f"latency thresholds {str(path)!r}: invalid UTF-8 byte sequence: "
+            f"{exc.reason}"
+        ) from exc
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidInputError(
+            f"latency thresholds {str(path)!r}: invalid JSON: {exc.msg}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise InvalidInputError(
+            f"latency thresholds {str(path)!r}: must be a JSON object"
+        )
+
+    missing = [name for name in LATENCY_THRESHOLD_FIELDS if name not in data]
+    if missing:
+        raise InvalidInputError(
+            f"latency thresholds {str(path)!r}: missing field(s): "
+            f"{', '.join(missing)}"
+        )
+    unknown = set(data) - set(LATENCY_THRESHOLD_FIELDS)
+    if unknown:
+        raise InvalidInputError(
+            f"latency thresholds {str(path)!r}: unknown field(s): "
+            f"{', '.join(sorted(unknown))}"
+        )
+
+    thresholds: dict[str, int] = {}
+    for name in LATENCY_THRESHOLD_FIELDS:
+        value = data[name]
+        if not _is_int(value) or value < 0:
+            raise InvalidInputError(
+                f"latency thresholds {str(path)!r}: {name} must be a "
+                "non-negative integer number of milliseconds"
+            )
+        thresholds[name] = value
+    return thresholds
+
+
+def _build_latency_breaches(
+    reports: list[dict], thresholds: dict[str, int]
+) -> list[dict]:
+    """按报告行序逐行挑出严格越界阶段，生成越界清单行。
+
+    仅本次运行新产出的报告行参与（续传已发布的历史行不再重查，故无新事件时
+    结果为空）；三个延迟字段只有「严格大于」同名阈值才算越界，等于不越界。
+    breached_stages 按 proof_latency_ms、relay_latency_ms、
+    destination_latency_ms 的固定顺序列出；失败报告行同样参与，
+    proof_status 原样带出。
+    """
+    breaches: list[dict] = []
+    for report in reports:
+        breached = [
+            name
+            for name in LATENCY_THRESHOLD_FIELDS
+            if report[name] > thresholds[name]
+        ]
+        if not breached:
+            continue
+        breaches.append(
+            {
+                "event_id": report["event_id"],
+                "chain_id": report["chain_id"],
+                "sequence": report["sequence"],
+                "proof_status": report["proof_status"],
+                "breached_stages": breached,
+                "attribution": report["attribution"],
+                "finalized_at": report["finalized_at"],
+            }
+        )
+    return breaches
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -943,6 +1055,8 @@ def watch(
     output_path: Optional[PathLike] = None,
     tolerate_failures: bool = False,
     continuity_output: Optional[PathLike] = None,
+    latency_thresholds: Optional[PathLike] = None,
+    latency_breach_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -972,7 +1086,33 @@ def watch(
     非游标之后，因此续传、追加与重复执行结果一致；隔离模式下证明失败的事件
     仍占有其 sequence。省略该参数时行为与旧版完全一致；任何领域错误抛出时
     都不写盘点文件。
+
+    同时（且必须成对）给出 ``latency_thresholds`` 与
+    ``latency_breach_output`` 时，在报告、检查点、连续性盘点都安全发布后，
+    最后再原子写出一份延迟越界清单（UTF-8 JSONL；详见
+    :func:`_build_latency_breaches`）。阈值文件为仅含 proof_latency_ms、
+    relay_latency_ms、destination_latency_ms 三个非负整数毫秒字段的 JSON
+    对象，不合规抛 InvalidInputError；两参数缺一对（API）同样抛
+    InvalidInputError。清单只查本次运行新产出的报告行（严格行序），三个延迟
+    字段仅严格大于同名阈值才越界，隔离模式的失败行同样参与
+    （proof_status="failed"），严格模式证明失败仍在任何发布前抛
+    ProofVerificationError。无越界或无新事件写空文件；领域错误时不写清单，
+    阈值文件本身的读取错误原样作为 OSError 子类传播。省略这对参数时行为与
+    旧版完全一致。
     """
+    if (latency_thresholds is None) != (latency_breach_output is None):
+        raise InvalidInputError(
+            "latency_thresholds and latency_breach_output must be given "
+            "together"
+        )
+
+    # 阈值是额外输入：在任何发布之前先加载并校验，使不合规阈值与结构非法
+    # 输入同口径处理——不写报告、不推进检查点、不写任何附加清单。文件本身
+    # 打不开等错误原样作为 OSError 子类传播。
+    thresholds: Optional[dict[str, int]] = None
+    if latency_thresholds is not None:
+        thresholds = load_latency_thresholds(latency_thresholds)
+
     events, data, lines = _load_input(input_path)
 
     parsed_checkpoint: Optional[_Checkpoint] = None
@@ -1042,6 +1182,17 @@ def watch(
             continuity_output, _render_reports(_build_continuity(events))
         )
 
+    # 延迟越界清单在报告、检查点、连续性盘点之后最后发布：只查本次运行新
+    # 产出的报告行（reports 即按行序的新行），无越界或无新事件时渲染为空
+    # 串，原子替换为空文件。走到这里时整批已定稿，故严格模式的证明失败不
+    # 可能到达此处。
+    if latency_breach_output is not None:
+        assert thresholds is not None
+        _atomic_write(
+            latency_breach_output,
+            _render_reports(_build_latency_breaches(reports, thresholds)),
+        )
+
     return reports
 
 
@@ -1051,10 +1202,22 @@ def run(
     output: Optional[PathLike] = None,
     tolerate_failures: bool = False,
     continuity_output: Optional[PathLike] = None,
+    latency_thresholds: Optional[PathLike] = None,
+    latency_breach_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
     ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）；
-    ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点。
+    ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点；
+    ``latency_thresholds`` 与 ``latency_breach_output`` 成对给定时最后原子
+    写出延迟越界清单（阈值文件与越界判定口径见 :func:`watch`）。
     """
-    return watch(input, checkpoint, output, tolerate_failures, continuity_output)
+    return watch(
+        input,
+        checkpoint,
+        output,
+        tolerate_failures,
+        continuity_output,
+        latency_thresholds,
+        latency_breach_output,
+    )

@@ -10,7 +10,36 @@
 
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
-输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点。
+输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
+可选的延迟越界清单。
+
+## 延迟越界清单
+
+成对传入 `--latency-thresholds PATH --latency-breach-output PATH`（模块
+API 为 `run(..., latency_thresholds=PATH, latency_breach_output=PATH)`）
+后，在报告、检查点、连续性盘点（若有）都安全发布之后，最后原子写出一份
+UTF-8 JSONL 越界清单；两个参数缺一不可（CLI 以 `InvalidArgument` 固定
+JSON、退出码 2 报错；API 抛 `InvalidInputError`）。
+
+- 阈值文件为 UTF-8 JSON 对象，**仅含** `proof_latency_ms`、
+  `relay_latency_ms`、`destination_latency_ms` 三个字段，值为非负整数
+  毫秒；不是 JSON 对象、缺字段、出现未知字段、值为布尔/浮点/字符串/
+  null/负数等都抛 `InvalidInputError`。
+- 按本次运行新产出报告行的输入行序逐行检查：三个延迟字段仅在**严格大于**
+  同名阈值时越界（等于不越界）。
+- 每个越界事件一行，字段为 `event_id`、`chain_id`、`sequence`、
+  `proof_status`、`breached_stages`、`attribution`、`finalized_at`；
+  `breached_stages` 按 `proof_latency_ms`、`relay_latency_ms`、
+  `destination_latency_ms` 的固定顺序列出该事件越界的阶段。
+- 只查本次运行的新报告行：续传已发布的历史行不重查，无新事件或无越界时
+  写空文件。
+- 隔离模式（`--tolerate-failures`）下证明失败的报告行同样参与，
+  `proof_status="failed"`；严格模式证明失败仍抛 `ProofVerificationError`，
+  报告、检查点、清单都不写。
+- 任何领域错误（输入/检查点/阈值不合规、证明失败等）都不写清单；清单不
+  改报告与检查点字段。省略这对参数时不生成额外文件，旧报告、检查点、
+  异常与退出码完全不变。阈值文件打不开、清单路径不可写等文件错误沿用
+  CLI 的 OSError 子类 JSON 错误与非零退出。
 
 ## 序列连续性盘点
 
