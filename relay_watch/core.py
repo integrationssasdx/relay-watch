@@ -33,6 +33,12 @@ InvalidInputError），不同链可复用同一 sequence；各链事件可交错
 跳过。旧版 last_sequence 与 schema_version 2 检查点仍按原规则读取，仅在
 确有新事件成功（隔离模式下成功或失败）后才升级 v3，升级前不伪造摘要；无
 新事件保持空操作，检查点文件原样保留。
+
+可选的序列连续性盘点（``continuity_output``）在整批成功、报告与检查点
+安全发布后原子写出：每链一行，统计该链结构合法事件数、已出现 sequence
+的最小/最大值，以及相邻 sequence 间空缺的升序闭区间与缺失总数。盘点覆盖
+整个当前输入而非游标之后，不参与游标，也不改报告字段；省略时行为与旧版
+完全一致。
 """
 
 from __future__ import annotations
@@ -826,6 +832,45 @@ def _render_reports(reports: list[dict]) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# 序列连续性盘点
+# --------------------------------------------------------------------------- #
+def _build_continuity(events: list[dict]) -> list[dict]:
+    """按链汇总 sequence 连续性，覆盖整个当前输入（与游标无关）。
+
+    每链一行，按该链在输入中的首次出现排序；sequence 可从任意非负值开始，
+    最小值之前不算缺口。missing_ranges 升序列出相邻已出现 sequence 之间的
+    空缺，每项为闭区间 {"start": s, "end": e}（两端皆缺失值）；单值或连续
+    时 ranges 为空、计数为 0。缺失范围只由已出现的整数 sequence 推导。
+    """
+    sequences_by_chain: dict[str, list[int]] = {}
+    for event in events:
+        sequences_by_chain.setdefault(event["chain_id"], []).append(
+            event["sequence"]
+        )
+
+    rows: list[dict] = []
+    for chain, sequences in sequences_by_chain.items():
+        ordered = sorted(sequences)
+        missing_ranges: list[dict] = []
+        missing_count = 0
+        for low, high in zip(ordered, ordered[1:]):
+            if high > low + 1:
+                missing_ranges.append({"start": low + 1, "end": high - 1})
+                missing_count += high - low - 1
+        rows.append(
+            {
+                "chain_id": chain,
+                "event_count": len(sequences),
+                "min_sequence": ordered[0],
+                "max_sequence": ordered[-1],
+                "missing_ranges": missing_ranges,
+                "missing_count": missing_count,
+            }
+        )
+    return rows
+
+
 def _read_report_rows(path: PathLike) -> list[dict]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -897,6 +942,7 @@ def watch(
     checkpoint: Optional[PathLike] = None,
     output_path: Optional[PathLike] = None,
     tolerate_failures: bool = False,
+    continuity_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -918,6 +964,14 @@ def watch(
     ``proof_status="failed"`` 行（携带 error_type/error_message）；成功与失败
     都算“已处理”，同样推进检查点，同链后续事件不受先前失败影响。结构性输入
     错误与检查点错误在两种模式下都直接抛出，不写报告、不推进检查点。
+
+    给定 ``continuity_output`` 时，在报告与检查点都安全发布后，额外原子写出
+    一份序列连续性盘点（UTF-8 JSONL，每链一行、按首次出现排序，字段为
+    chain_id、event_count、min_sequence、max_sequence、missing_ranges、
+    missing_count；详见 :func:`_build_continuity`）。盘点覆盖整个当前输入而
+    非游标之后，因此续传、追加与重复执行结果一致；隔离模式下证明失败的事件
+    仍占有其 sequence。省略该参数时行为与旧版完全一致；任何领域错误抛出时
+    都不写盘点文件。
     """
     events, data, lines = _load_input(input_path)
 
@@ -981,6 +1035,13 @@ def watch(
             checkpoint, _render_checkpoint(new_cursors, processed_lines, digest)
         )
 
+    # 连续性盘点最后发布：此时报告与检查点都已安全落盘，整批已成功；盘点由
+    # 全部已读取事件推导，与游标无关，故空批（无新事件）也照常写出同一内容。
+    if continuity_output is not None:
+        _atomic_write(
+            continuity_output, _render_reports(_build_continuity(events))
+        )
+
     return reports
 
 
@@ -989,9 +1050,11 @@ def run(
     checkpoint: Optional[PathLike] = None,
     output: Optional[PathLike] = None,
     tolerate_failures: bool = False,
+    continuity_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
-    ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）。
+    ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）；
+    ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点。
     """
-    return watch(input, checkpoint, output, tolerate_failures)
+    return watch(input, checkpoint, output, tolerate_failures, continuity_output)

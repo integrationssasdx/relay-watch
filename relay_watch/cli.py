@@ -1,7 +1,7 @@
 """relay-watch 命令行接口。
 
 relay-watch --input IN --checkpoint CP --output OUT
-    [--tolerate-failures [{true,false}]]
+    [--continuity-output PATH] [--tolerate-failures [{true,false}]]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -82,6 +82,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL 报告输出路径（原子写出）",
     )
     parser.add_argument(
+        "--continuity-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：序列连续性盘点输出路径（整批成功后原子替换的 UTF-8 "
+            "JSONL，每链一行：chain_id、event_count、min_sequence、"
+            "max_sequence、missing_ranges、missing_count）。盘点覆盖整个"
+            "当前输入，与检查点游标无关；省略时不生成"
+        ),
+    )
+    parser.add_argument(
         "--tolerate-failures",
         metavar="{true,false}",
         nargs="?",
@@ -107,6 +118,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.checkpoint,
             args.output,
             tolerate_failures=args.tolerate_failures,
+            continuity_output=args.continuity_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

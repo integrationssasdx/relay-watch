@@ -2418,3 +2418,404 @@ def test_cli_first_run_writes_v3_checkpoint(workspace):
         "processed_lines",
         "input_prefix_sha256",
     }
+
+
+# ---------------------------------------------------------------------------
+# Sequence continuity inventory (--continuity-output)
+# --------------------------------------------------------------------------- #
+
+
+def read_continuity(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_continuity_single_chain_gaps_closed_intervals(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 2, "A2", 2000),
+        chain_event("chain-a", 5, "A5", 3000),
+        chain_event("chain-a", 6, "A6", 4000),
+        chain_event("chain-a", 10, "A10", 5000),
+    ]
+    write_events(workspace["input"], events)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    assert read_continuity(continuity) == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 5,
+            "min_sequence": 1,
+            "max_sequence": 10,
+            "missing_ranges": [
+                {"start": 3, "end": 4},
+                {"start": 7, "end": 9},
+            ],
+            "missing_count": 5,
+        }
+    ]
+
+
+def test_continuity_multichain_first_appearance_order_and_shared_sequences(
+    workspace,
+):
+    # Both chains reuse sequence 2; gaps are computed per chain, rows follow
+    # first appearance in the interleaved input.
+    events = [
+        chain_event("chain-b", 2, "B2", 1000),
+        chain_event("chain-a", 2, "A2", 2000),
+        chain_event("chain-b", 4, "B4", 3000),
+        chain_event("chain-a", 3, "A3", 4000),
+    ]
+    write_events(workspace["input"], events)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    assert read_continuity(continuity) == [
+        {
+            "chain_id": "chain-b",
+            "event_count": 2,
+            "min_sequence": 2,
+            "max_sequence": 4,
+            "missing_ranges": [{"start": 3, "end": 3}],
+            "missing_count": 1,
+        },
+        {
+            "chain_id": "chain-a",
+            "event_count": 2,
+            "min_sequence": 2,
+            "max_sequence": 3,
+            "missing_ranges": [],
+            "missing_count": 0,
+        },
+    ]
+
+
+def test_continuity_sequence_may_start_above_zero_without_gap(workspace):
+    write_events(
+        workspace["input"],
+        [
+            chain_event("chain-a", 7, "A7", 1000),
+            chain_event("chain-a", 8, "A8", 2000),
+        ],
+    )
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    rows = read_continuity(continuity)
+    assert rows[0]["min_sequence"] == 7
+    assert rows[0]["missing_ranges"] == []
+    assert rows[0]["missing_count"] == 0
+
+
+def test_continuity_single_event_has_empty_ranges(workspace):
+    write_events(workspace["input"], [make_event(sequence=4)])
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    assert read_continuity(continuity) == [
+        {
+            "chain_id": "chain-7",
+            "event_count": 1,
+            "min_sequence": 4,
+            "max_sequence": 4,
+            "missing_ranges": [],
+            "missing_count": 0,
+        }
+    ]
+
+
+def test_continuity_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    assert continuity.exists()
+    assert continuity.read_text(encoding="utf-8") == ""
+
+
+def test_continuity_omitted_writes_nothing_and_behavior_unchanged(workspace):
+    write_events(workspace["input"], three_events())
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert not continuity.exists()
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_continuity_covers_whole_input_across_resume_and_append(workspace):
+    first_batch = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 4, "A4", 2000),
+    ]
+    write_events(workspace["input"], first_batch)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    # Append a later event; the resumed run inventories the whole file, not
+    # just the newly selected tail.
+    second_batch = first_batch + [chain_event("chain-a", 7, "A7", 3000)]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+    assert [r["sequence"] for r in reports] == [7]
+
+    expected = [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "min_sequence": 1,
+            "max_sequence": 7,
+            "missing_ranges": [
+                {"start": 2, "end": 3},
+                {"start": 5, "end": 6},
+            ],
+            "missing_count": 4,
+        }
+    ]
+    assert read_continuity(continuity) == expected
+
+    # A no-op rerun rewrites the identical inventory.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+    assert again == []
+    assert read_continuity(continuity) == expected
+
+
+def test_continuity_tolerate_failures_failed_event_still_occupies_sequence(
+    workspace,
+):
+    write_events(workspace["input"], three_mixed_events())  # good, bad, good
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        continuity_output=continuity,
+    )
+
+    # The failed seq-2 event still holds its sequence: no gap is reported.
+    assert read_continuity(continuity) == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "min_sequence": 1,
+            "max_sequence": 3,
+            "missing_ranges": [],
+            "missing_count": 0,
+        }
+    ]
+
+
+def test_continuity_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            continuity_output=continuity,
+        )
+
+    assert not continuity.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_continuity_invalid_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            continuity_output=continuity,
+        )
+
+    assert not continuity.exists()
+
+
+def test_continuity_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            continuity_output=continuity,
+        )
+
+    assert not continuity.exists()
+    assert not workspace["output"].exists()
+
+
+def test_continuity_does_not_participate_in_cursor_or_report(workspace):
+    write_events(workspace["input"], three_events())
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+    )
+
+    # Report rows keep their exact field set; the checkpoint is plain v3.
+    row = json.loads(workspace["output"].read_text().splitlines()[0])
+    assert set(row) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+        "attribution",
+        "finalized_at",
+    }
+    assert set(read_checkpoint(workspace)) == {
+        "schema_version",
+        "last_sequence_by_chain",
+        "processed_lines",
+        "input_prefix_sha256",
+    }
+
+
+def test_cli_continuity_output_success(workspace):
+    events = [
+        chain_event("chain-a", 1, "A1", 1000),
+        chain_event("chain-a", 3, "A3", 2000),
+    ]
+    write_events(workspace["input"], events)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--continuity-output", str(continuity),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert read_continuity(continuity) == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 2,
+            "min_sequence": 1,
+            "max_sequence": 3,
+            "missing_ranges": [{"start": 2, "end": 2}],
+            "missing_count": 1,
+        }
+    ]
+
+
+def test_cli_continuity_output_omitted_is_unchanged(workspace):
+    write_events(workspace["input"], [make_event()])
+    continuity = workspace["output"].with_name("continuity.jsonl")
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert workspace["output"].exists()
+    assert not continuity.exists()
+
+
+def test_cli_continuity_output_unwritable_path_is_oserror_json(workspace):
+    write_events(workspace["input"], [make_event()])
+    missing_dir = workspace["output"].with_name("no-such-dir")
+    # Block makedirs by placing a regular file where the directory must be.
+    missing_dir.write_text("not a directory", encoding="utf-8")
+    continuity = missing_dir / "continuity.jsonl"
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--continuity-output", str(continuity),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+
+
+def test_cli_continuity_domain_error_leaves_no_continuity_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    continuity = workspace["output"].with_name("continuity.jsonl")
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--continuity-output", str(continuity),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not continuity.exists()
+    assert not workspace["output"].exists()
