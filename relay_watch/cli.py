@@ -2,6 +2,7 @@
 
 relay-watch --input IN --checkpoint CP --output OUT
     [--continuity-output PATH] [--tolerate-failures [{true,false}]]
+    [--latency-thresholds PATH --latency-breach-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -93,6 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--latency-thresholds",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：延迟阈值文件路径（UTF-8 JSON 对象，仅含 "
+            "proof_latency_ms、relay_latency_ms、destination_latency_ms，"
+            "值为非负整数毫秒）。必须与 --latency-breach-output 成对给出"
+        ),
+    )
+    parser.add_argument(
+        "--latency-breach-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：延迟越界清单输出路径（正常发布完成后最后原子替换的 "
+            "UTF-8 JSONL，按报告行序逐行：event_id、chain_id、sequence、"
+            "proof_status、breached_stages、attribution、finalized_at；"
+            "无越界或无新事件写空文件）。必须与 --latency-thresholds "
+            "成对给出"
+        ),
+    )
+    parser.add_argument(
         "--tolerate-failures",
         metavar="{true,false}",
         nargs="?",
@@ -112,6 +135,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if (args.latency_thresholds is None) != (args.latency_breach_output is None):
+        emit_error(
+            "InvalidArgument",
+            "--latency-thresholds and --latency-breach-output must be given "
+            "together",
+        )
+        return 2
+
     try:
         run(
             args.input,
@@ -119,6 +150,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.output,
             tolerate_failures=args.tolerate_failures,
             continuity_output=args.continuity_output,
+            latency_thresholds=args.latency_thresholds,
+            latency_breach_output=args.latency_breach_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

@@ -2819,3 +2819,435 @@ def test_cli_continuity_domain_error_leaves_no_continuity_file(workspace):
     assert json.loads(result.stderr)["error"] == "ProofVerificationError"
     assert not continuity.exists()
     assert not workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# Latency breach inventory (--latency-thresholds / --latency-breach-output)
+# ---------------------------------------------------------------------------
+
+
+def latency_paths(workspace):
+    return (
+        workspace["output"].with_name("thresholds.json"),
+        workspace["output"].with_name("breaches.jsonl"),
+    )
+
+
+def write_thresholds(path, mapping):
+    path.write_text(json.dumps(mapping), encoding="utf-8")
+
+
+def read_breaches(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_latency_breach_rows_order_and_strictly_greater(workspace):
+    events = [
+        # proof/relay/destination latencies: 400/500/400 — relay and
+        # destination only equal their thresholds, so no breach.
+        chain_event("chain-a", 1, "A1", 1000),
+        # 400/500/1400 — only destination breaches.
+        on_chain(
+            "chain-a", event_id="A2", sequence=2,
+            observed_at=2000, proof_submitted_at=2100,
+            proof_verified_at=2500, finalized_at=3900,
+        ),
+        # 600/700/200 — proof and relay breach, in that fixed order.
+        on_chain(
+            "chain-a", event_id="A3", sequence=3,
+            observed_at=4000, proof_submitted_at=4100,
+            proof_verified_at=4700, finalized_at=4900,
+        ),
+    ]
+    write_events(workspace["input"], events)
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(
+        thresholds,
+        {
+            "proof_latency_ms": 500,
+            "relay_latency_ms": 500,
+            "destination_latency_ms": 400,
+        },
+    )
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+
+    assert read_breaches(breaches) == [
+        {
+            "event_id": "A2",
+            "chain_id": "chain-a",
+            "sequence": 2,
+            "proof_status": "verified",
+            "breached_stages": ["destination_latency_ms"],
+            "attribution": "destination",
+            "finalized_at": 3900,
+        },
+        {
+            "event_id": "A3",
+            "chain_id": "chain-a",
+            "sequence": 3,
+            "proof_status": "verified",
+            "breached_stages": ["proof_latency_ms", "relay_latency_ms"],
+            "attribution": "relay",
+            "finalized_at": 4900,
+        },
+    ]
+
+
+def test_latency_breach_no_breach_writes_empty_file(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"proof_latency_ms": 10**9})
+
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert breaches.exists()
+    assert breaches.read_text(encoding="utf-8") == ""
+    # Report and checkpoint are published exactly as without the option.
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_latency_breach_no_new_events_rewrites_empty_file(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 100})
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+    assert len(read_breaches(breaches)) == 3
+
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+    assert again == []
+    assert breaches.read_text(encoding="utf-8") == ""
+
+
+def test_latency_breach_lists_only_new_events_after_resume(workspace):
+    events = three_events()
+    write_events(workspace["input"], events[:2])
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 100})
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+    assert [r["event_id"] for r in read_breaches(breaches)] == ["A", "B"]
+
+    write_events(workspace["input"], events)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+    assert [r["event_id"] for r in read_breaches(breaches)] == ["C"]
+
+
+def test_latency_breach_failed_rows_participate_in_tolerate_mode(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 400})
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+
+    rows = read_breaches(breaches)
+    assert [r["event_id"] for r in rows] == ["A1", "A2", "A3"]
+    assert [r["proof_status"] for r in rows] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    # Breach rows carry exactly the seven documented fields — no error
+    # details and no latency numbers.
+    assert set(rows[1]) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "breached_stages",
+        "attribution",
+        "finalized_at",
+    }
+    assert rows[1]["breached_stages"] == ["relay_latency_ms"]
+
+
+def test_latency_breach_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 1})
+
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_latency_breach_invalid_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 1})
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+
+
+def test_latency_breach_publishes_after_report_checkpoint_continuity(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+    write_thresholds(thresholds, {"destination_latency_ms": 500})
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+        latency_thresholds=thresholds,
+        latency_breach_output=breaches,
+    )
+
+    assert workspace["output"].exists()
+    assert workspace["checkpoint"].exists()
+    assert continuity.exists()
+    # All three events have destination latency 900 > 500.
+    assert [r["event_id"] for r in read_breaches(breaches)] == ["A", "B", "C"]
+
+
+def test_latency_breach_omitted_writes_nothing_and_behavior_unchanged(workspace):
+    write_events(workspace["input"], three_events())
+    _thresholds, breaches = latency_paths(workspace)
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert not breaches.exists()
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_latency_arguments_must_be_paired_api(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 1})
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+        )
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+    assert not workspace["output"].exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"proof_latency_ms": -1},
+        {"proof_latency_ms": 1.5},
+        {"proof_latency_ms": "100"},
+        {"proof_latency_ms": True},
+        {"proof_latency_ms": None},
+        {"proof_latency_ms": [100]},
+        {"unknown_stage_ms": 1},
+        {"proof_latency_ms": 1, "extra": 2},
+    ],
+)
+def test_latency_thresholds_invalid_values_raise(workspace, payload):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, payload)
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+    assert not workspace["output"].exists()
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", '"x"', "123", "{not json"])
+def test_latency_thresholds_non_object_or_malformed_raises(workspace, text):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    thresholds.write_text(text, encoding="utf-8")
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+
+
+def test_latency_thresholds_missing_file_raises_oserror(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+
+    with pytest.raises(FileNotFoundError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_thresholds=thresholds,
+            latency_breach_output=breaches,
+        )
+
+    assert not breaches.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_latency_breach_success(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": 100})
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-thresholds", str(thresholds),
+        "--latency-breach-output", str(breaches),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert [r["event_id"] for r in read_breaches(breaches)] == ["A", "B", "C"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--latency-thresholds", "thresholds.json"],
+        ["--latency-breach-output", "breaches.jsonl"],
+    ],
+)
+def test_cli_latency_arguments_must_be_paired(workspace, extra):
+    write_events(workspace["input"], three_events())
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        *extra,
+    )
+
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "InvalidArgument"
+    assert isinstance(payload["message"], str) and payload["message"]
+    assert not workspace["output"].exists()
+
+
+def test_cli_latency_thresholds_missing_file_is_oserror_json(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-thresholds", str(thresholds),
+        "--latency-breach-output", str(breaches),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "FileNotFoundError"
+    assert not breaches.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_latency_thresholds_invalid_is_invalid_input_error(workspace):
+    write_events(workspace["input"], three_events())
+    thresholds, breaches = latency_paths(workspace)
+    write_thresholds(thresholds, {"relay_latency_ms": -1})
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-thresholds", str(thresholds),
+        "--latency-breach-output", str(breaches),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "InvalidInputError"
+    assert not breaches.exists()
+    assert not workspace["output"].exists()

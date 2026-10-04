@@ -29,13 +29,25 @@ missing_ranges（相邻已出现 sequence 间空缺的升序闭区间）、missi
 盘点覆盖整个当前输入而非游标之后，续传、追加与重复执行结果一致；省略该
 参数时行为与旧版完全一致。
 
+可选的延迟越界清单（``latency_thresholds`` + ``latency_breach_output`` /
+``--latency-thresholds`` + ``--latency-breach-output``，两参数必须成对）
+在正常发布（报告、检查点、连续性盘点）完成后最后原子写出：阈值文件是仅含
+proof_latency_ms、relay_latency_ms、destination_latency_ms、值为非负整数
+毫秒的 UTF-8 JSON 对象；本次报告行中某段延迟严格大于同名阈值即越界，清单
+按报告行序逐行给出 event_id、chain_id、sequence、proof_status、
+breached_stages、attribution、finalized_at。隔离模式的失败行同样参与；
+无越界或无新事件写空文件；领域错误不写清单；省略该对参数时行为与旧版
+完全一致。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
-  tolerate_failures=False, continuity_output=None)`` -> list[dict]
+  tolerate_failures=False, continuity_output=None,
+  latency_thresholds=None, latency_breach_output=None)`` -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
-  [--continuity-output PATH] [--tolerate-failures [{true,false}]]``；
+  [--continuity-output PATH] [--tolerate-failures [{true,false}]]
+  [--latency-thresholds PATH --latency-breach-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

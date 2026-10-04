@@ -39,6 +39,16 @@ InvalidInputError），不同链可复用同一 sequence；各链事件可交错
 的最小/最大值，以及相邻 sequence 间空缺的升序闭区间与缺失总数。盘点覆盖
 整个当前输入而非游标之后，不参与游标，也不改报告字段；省略时行为与旧版
 完全一致。
+
+可选的延迟越界清单（``latency_thresholds`` 与 ``latency_breach_output``
+成对给出）在正常发布（报告、检查点、连续性盘点）全部完成后最后原子写出：
+阈值文件是仅含 proof_latency_ms、relay_latency_ms、destination_latency_ms
+三个键、值为非负整数毫秒的 UTF-8 JSON 对象；本次报告行中某段延迟严格大于
+同名阈值即记为越界，按报告行序逐行列出 event_id、chain_id、sequence、
+proof_status、breached_stages（按 proof/relay/destination 顺序）、
+attribution、finalized_at。隔离模式的失败行同样参与；无越界或无新事件写
+空文件；任何领域错误抛出时都不写清单。两参数缺一则抛 InvalidInputError；
+省略时行为与旧版完全一致。
 """
 
 from __future__ import annotations
@@ -91,6 +101,14 @@ PROOF_FIELDS = (
 _SOURCE = "source"
 _RELAY = "relay"
 _DESTINATION = "destination"
+
+# 延迟越界清单：阈值文件允许的键（也是 breached_stages 的列序），与报告行
+# 的三段延迟字段同名同序。
+LATENCY_STAGE_FIELDS = (
+    "proof_latency_ms",
+    "relay_latency_ms",
+    "destination_latency_ms",
+)
 
 
 class RelayWatchError(Exception):
@@ -871,6 +889,78 @@ def _build_continuity(events: list[dict]) -> list[dict]:
     return rows
 
 
+# --------------------------------------------------------------------------- #
+# 延迟越界清单
+# --------------------------------------------------------------------------- #
+def _load_latency_thresholds(source: PathLike) -> dict[str, int]:
+    """读取并校验延迟阈值文件，返回 {阶段字段名: 非负整数毫秒}。
+
+    阈值文件是 UTF-8 JSON 对象，仅允许 :data:`LATENCY_STAGE_FIELDS` 中的键，
+    值必须是非负整数（布尔不算）。结构或取值不合规一律抛 InvalidInputError；
+    文件本身不可读等错误沿用 OSError 子类型直接抛出，不包装。
+    """
+    with open(source, "r", encoding="utf-8") as handle:
+        text = handle.read()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidInputError(
+            f"latency thresholds {str(source)!r}: is not valid JSON: {exc.msg}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise InvalidInputError(
+            f"latency thresholds {str(source)!r}: must be a JSON object"
+        )
+
+    thresholds: dict[str, int] = {}
+    for name, value in data.items():
+        if name not in LATENCY_STAGE_FIELDS:
+            raise InvalidInputError(
+                f"latency thresholds {str(source)!r}: unknown field {name!r}; "
+                f"allowed: {', '.join(LATENCY_STAGE_FIELDS)}"
+            )
+        if not _is_int(value) or value < 0:
+            raise InvalidInputError(
+                f"latency thresholds {str(source)!r}: {name} must be a "
+                "non-negative integer number of milliseconds"
+            )
+        thresholds[name] = value
+    return thresholds
+
+
+def _build_latency_breaches(
+    reports: list[dict], thresholds: dict[str, int]
+) -> list[dict]:
+    """按报告行序筛出越界行；某段延迟严格大于同名阈值才算越界。
+
+    成功行与隔离模式的失败行同一口径；breached_stages 固定按
+    proof_latency_ms、relay_latency_ms、destination_latency_ms 顺序列出。
+    """
+    rows: list[dict] = []
+    for report in reports:
+        breached = [
+            name
+            for name in LATENCY_STAGE_FIELDS
+            if name in thresholds and report[name] > thresholds[name]
+        ]
+        if not breached:
+            continue
+        rows.append(
+            {
+                "event_id": report["event_id"],
+                "chain_id": report["chain_id"],
+                "sequence": report["sequence"],
+                "proof_status": report["proof_status"],
+                "breached_stages": breached,
+                "attribution": report["attribution"],
+                "finalized_at": report["finalized_at"],
+            }
+        )
+    return rows
+
+
 def _read_report_rows(path: PathLike) -> list[dict]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -943,6 +1033,8 @@ def watch(
     output_path: Optional[PathLike] = None,
     tolerate_failures: bool = False,
     continuity_output: Optional[PathLike] = None,
+    latency_thresholds: Optional[PathLike] = None,
+    latency_breach_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -972,7 +1064,29 @@ def watch(
     非游标之后，因此续传、追加与重复执行结果一致；隔离模式下证明失败的事件
     仍占有其 sequence。省略该参数时行为与旧版完全一致；任何领域错误抛出时
     都不写盘点文件。
+
+    ``latency_thresholds`` 与 ``latency_breach_output`` 必须成对给出，缺一则
+    抛 :class:`InvalidInputError`。给定时，阈值文件（仅含三段延迟字段名、值
+    为非负整数毫秒的 UTF-8 JSON 对象，详见 :func:`_load_latency_thresholds`）
+    在批处理前校验；整批成功、报告与检查点及连续性盘点都安全发布后，最后原子
+    写出延迟越界清单（UTF-8 JSONL）：本次报告行中某段延迟严格大于同名阈值
+    即越界，每行字段为 event_id、chain_id、sequence、proof_status、
+    breached_stages（按 proof/relay/destination 顺序）、attribution、
+    finalized_at。隔离模式的失败行同样参与；无越界或无新事件写空文件；任何
+    领域错误抛出时都不写清单。省略该对参数时行为与旧版完全一致。
     """
+    if (latency_thresholds is None) != (latency_breach_output is None):
+        raise InvalidInputError(
+            "latency_thresholds and latency_breach_output must be given "
+            "together"
+        )
+
+    thresholds: Optional[dict[str, int]] = None
+    if latency_thresholds is not None:
+        # 阈值文件在批处理前校验：不合规（InvalidInputError）或不可读
+        # （OSError 子类型）都在任何发布之前失败。
+        thresholds = _load_latency_thresholds(latency_thresholds)
+
     events, data, lines = _load_input(input_path)
 
     parsed_checkpoint: Optional[_Checkpoint] = None
@@ -1042,6 +1156,16 @@ def watch(
             continuity_output, _render_reports(_build_continuity(events))
         )
 
+    # 延迟越界清单在正常发布（报告、检查点、连续性盘点）全部完成后最后原子
+    # 写出：只覆盖本次新产生的报告行，故无新事件或无越界时写空文件；任何
+    # 领域错误都在此前抛出，不会留下清单。
+    if latency_breach_output is not None:
+        assert thresholds is not None
+        _atomic_write(
+            latency_breach_output,
+            _render_reports(_build_latency_breaches(reports, thresholds)),
+        )
+
     return reports
 
 
@@ -1051,10 +1175,22 @@ def run(
     output: Optional[PathLike] = None,
     tolerate_failures: bool = False,
     continuity_output: Optional[PathLike] = None,
+    latency_thresholds: Optional[PathLike] = None,
+    latency_breach_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
     ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）；
-    ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点。
+    ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点；
+    ``latency_thresholds`` 与 ``latency_breach_output`` 成对给定时在正常
+    发布后最后原子写出延迟越界清单。
     """
-    return watch(input, checkpoint, output, tolerate_failures, continuity_output)
+    return watch(
+        input,
+        checkpoint,
+        output,
+        tolerate_failures,
+        continuity_output,
+        latency_thresholds,
+        latency_breach_output,
+    )
