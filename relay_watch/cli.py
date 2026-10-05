@@ -3,6 +3,7 @@
 relay-watch --input IN --checkpoint CP --output OUT
     [--continuity-output PATH] [--tolerate-failures [{true,false}]]
     [--latency-thresholds PATH --latency-breach-output PATH]
+    [--latency-profile-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -128,6 +129,20 @@ def build_parser() -> argparse.ArgumentParser:
             "--latency-thresholds 成对给出；无越界或无新事件时写空文件"
         ),
     )
+    parser.add_argument(
+        "--latency-profile-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：链级延迟画像输出路径（整批成功、报告/检查点/连续性盘点"
+            "发布后、延迟越界清单之前原子替换的 UTF-8 JSONL，按 chain_id "
+            "首次出现顺序每链一行：chain_id、event_count、proof_latency_ms、"
+            "relay_latency_ms、destination_latency_ms、attribution_counts；"
+            "三个延迟对象仅含 min/p50/p95/max，p50/p95 用最近秩）。画像覆盖"
+            "整个当前输入的全部结构合法事件，与检查点游标无关；空输入写空"
+            "文件；省略时不生成"
+        ),
+    )
     return parser
 
 
@@ -154,6 +169,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continuity_output=args.continuity_output,
             latency_thresholds=args.latency_thresholds,
             latency_breach_output=args.latency_breach_output,
+            latency_profile_output=args.latency_profile_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

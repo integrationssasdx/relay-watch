@@ -50,6 +50,18 @@ destination_latency_ms）。隔离模式下的失败报告行同样参与（proo
 failed）；严格模式的证明失败仍在发布前抛 ProofVerificationError，不写清单。
 无越界或无新事件时写空文件；任何领域错误都不写清单。省略这对参数时行为与
 旧版完全一致。
+
+可选的链级延迟画像（``latency_profile_output``）在整批输入完成结构校验与
+证明处理、报告、检查点及已启用的连续性盘点安全发布后、延迟越界清单之前，
+原子替换一份 UTF-8 JSONL：画像覆盖当前输入全部结构合法事件（而非游标后的
+新行），多链交错时按 chain_id 首次出现顺序每链一行，空输入写空文件。每行
+含 chain_id、event_count、proof_latency_ms、relay_latency_ms、
+destination_latency_ms、attribution_counts；三个延迟对象仅含
+min/p50/p95/max，p50/p95 用最近秩 max(1, ceil(0.50*n)) 与
+max(1, ceil(0.95*n))，attribution_counts 固定含 source/relay/destination
+三键。隔离模式下 proof_status=failed 的事件与 verified 同一口径参与统计；
+严格模式证明失败仍抛 ProofVerificationError，画像与所有其他输出一样不写。
+省略该参数时行为与旧版完全一致。
 """
 
 from __future__ import annotations
@@ -1035,6 +1047,73 @@ def _build_latency_breaches(
 
 
 # --------------------------------------------------------------------------- #
+# 链级延迟画像
+# --------------------------------------------------------------------------- #
+def _latency_summary(values: list[int]) -> dict:
+    """升序整数样本的 min/p50/p95/max。
+
+    p50、p95 用最近秩：秩为 max(1, ceil(0.50*n)) 与 max(1, ceil(0.95*n))
+    （1 基，n 为样本数），单事件四项相同。秩用整数算术计算，与
+    ceil(p * n) 的浮点结果逐值相等。
+    """
+    ordered = sorted(values)
+    n = len(ordered)
+    rank50 = max(1, (n + 1) // 2)
+    rank95 = max(1, (95 * n + 99) // 100)
+    return {
+        "min": ordered[0],
+        "p50": ordered[rank50 - 1],
+        "p95": ordered[rank95 - 1],
+        "max": ordered[-1],
+    }
+
+
+def _build_latency_profile(events: list[dict]) -> list[dict]:
+    """按链聚合延迟画像，覆盖整个当前输入（与游标无关）。
+
+    每链一行，按该链在输入中的首次出现排序；三个延迟对象由该链全部结构
+    合法事件的同名字段（与报告行同一口径的整数毫秒差值）汇总。隔离模式下
+    证明失败的事件与成功事件同一口径参与——其延迟与归因同样由事件字段
+    确定。attribution_counts 固定含 source/relay/destination 三键，按现有
+    归因口径计数，未出现记 0。
+    """
+    latencies_by_chain: dict[str, dict[str, list[int]]] = {}
+    attributions_by_chain: dict[str, dict[str, int]] = {}
+    for event in events:
+        chain = event["chain_id"]
+        fields = _latency_fields(event)
+        chain_latencies = latencies_by_chain.setdefault(
+            chain, {name: [] for name in LATENCY_THRESHOLD_FIELDS}
+        )
+        for name in LATENCY_THRESHOLD_FIELDS:
+            chain_latencies[name].append(fields[name])
+        counts = attributions_by_chain.setdefault(
+            chain, {_SOURCE: 0, _RELAY: 0, _DESTINATION: 0}
+        )
+        counts[fields["attribution"]] += 1
+
+    rows: list[dict] = []
+    for chain, chain_latencies in latencies_by_chain.items():
+        rows.append(
+            {
+                "chain_id": chain,
+                "event_count": len(chain_latencies["proof_latency_ms"]),
+                "proof_latency_ms": _latency_summary(
+                    chain_latencies["proof_latency_ms"]
+                ),
+                "relay_latency_ms": _latency_summary(
+                    chain_latencies["relay_latency_ms"]
+                ),
+                "destination_latency_ms": _latency_summary(
+                    chain_latencies["destination_latency_ms"]
+                ),
+                "attribution_counts": attributions_by_chain[chain],
+            }
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -1057,6 +1136,7 @@ def watch(
     continuity_output: Optional[PathLike] = None,
     latency_thresholds: Optional[PathLike] = None,
     latency_breach_output: Optional[PathLike] = None,
+    latency_profile_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -1099,6 +1179,14 @@ def watch(
     ProofVerificationError。无越界或无新事件写空文件；领域错误时不写清单，
     阈值文件本身的读取错误原样作为 OSError 子类传播。省略这对参数时行为与
     旧版完全一致。
+
+    给定 ``latency_profile_output`` 时，在报告、检查点、连续性盘点都安全
+    发布后、延迟越界清单之前，原子替换一份链级延迟画像（UTF-8 JSONL；详见
+    :func:`_build_latency_profile`）。画像覆盖当前输入全部结构合法事件而
+    非游标之后，按 chain_id 首次出现顺序每链一行，空输入写空文件；隔离
+    模式下失败事件与成功事件同一口径参与统计，严格模式证明失败仍在任何
+    发布前抛 ProofVerificationError。任何领域错误抛出时都不写画像；省略
+    该参数时行为与旧版完全一致。
     """
     if (latency_thresholds is None) != (latency_breach_output is None):
         raise InvalidInputError(
@@ -1182,6 +1270,16 @@ def watch(
             continuity_output, _render_reports(_build_continuity(events))
         )
 
+    # 链级延迟画像在报告、检查点、连续性盘点之后、延迟越界清单之前发布：由
+    # 全部已读取且结构合法的事件推导，与游标无关，故空批（无新事件）与空
+    # 输入也照常写出（空输入渲染为空串，原子替换为空文件）。走到这里时整批
+    # 已定稿，严格模式的证明失败不可能到达此处。
+    if latency_profile_output is not None:
+        _atomic_write(
+            latency_profile_output,
+            _render_reports(_build_latency_profile(events)),
+        )
+
     # 延迟越界清单在报告、检查点、连续性盘点之后最后发布：只查本次运行新
     # 产出的报告行（reports 即按行序的新行），无越界或无新事件时渲染为空
     # 串，原子替换为空文件。走到这里时整批已定稿，故严格模式的证明失败不
@@ -1204,13 +1302,16 @@ def run(
     continuity_output: Optional[PathLike] = None,
     latency_thresholds: Optional[PathLike] = None,
     latency_breach_output: Optional[PathLike] = None,
+    latency_profile_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
     ``tolerate_failures`` 为真时进入逐事件失败隔离模式（见 :func:`watch`）；
     ``continuity_output`` 给定时在整批成功后额外原子写出序列连续性盘点；
     ``latency_thresholds`` 与 ``latency_breach_output`` 成对给定时最后原子
-    写出延迟越界清单（阈值文件与越界判定口径见 :func:`watch`）。
+    写出延迟越界清单（阈值文件与越界判定口径见 :func:`watch`）；
+    ``latency_profile_output`` 给定时在连续性盘点之后、越界清单之前原子
+    替换链级延迟画像（口径见 :func:`watch`）。
     """
     return watch(
         input,
@@ -1220,4 +1321,5 @@ def run(
         continuity_output,
         latency_thresholds,
         latency_breach_output,
+        latency_profile_output,
     )

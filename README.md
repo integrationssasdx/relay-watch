@@ -11,7 +11,31 @@
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
 输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
-可选的延迟越界清单。
+可选的延迟越界清单；可选的链级延迟画像。
+
+## 链级延迟画像
+
+传入 `--latency-profile-output PATH`（模块 API 为
+`run(..., latency_profile_output=PATH)`）后，在整批输入完成结构校验与
+证明处理、报告、检查点及已启用的连续性盘点安全发布之后、延迟越界清单
+之前，原子替换一份 UTF-8 JSONL 画像：覆盖当前输入**全部结构合法事件**
+（而非游标后的新行），多链交错时按 `chain_id` 首次出现顺序每链一行，
+空输入写空文件。
+
+- 每行字段为 `chain_id`、`event_count`、`proof_latency_ms`、
+  `relay_latency_ms`、`destination_latency_ms`、`attribution_counts`。
+- 三个延迟对象**仅含** `min`、`p50`、`p95`、`max`，取该链事件同名字段
+  （与报告行同一口径的整数毫秒）的升序数据；`p50`/`p95` 用最近秩，秩为
+  `max(1, ceil(0.50*n))`、`max(1, ceil(0.95*n))`（`n` 即 `event_count`），
+  单事件四项相同。
+- `attribution_counts` 固定含 `source`、`relay`、`destination` 三键，按
+  现有归因口径计数，未出现记 0。
+- 隔离模式下 `proof_status="failed"` 的事件与成功事件同一口径参与统计；
+  严格模式证明失败仍抛 `ProofVerificationError`，报告、检查点、连续性
+  盘点、延迟越界清单与画像都不写。
+- 画像不参与游标，也不改报告、检查点与其他清单的字段；任何领域错误都
+  不写画像。省略该参数时不生成额外文件，旧报告、检查点、异常与退出码
+  完全不变。画像路径不可写沿用 CLI 的 OSError 子类 JSON 错误与非零退出。
 
 ## 延迟越界清单
 
