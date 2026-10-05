@@ -77,6 +77,23 @@ ceil(missing_count/(event_count+missing_count)*1000)；三个 p95 取链级延�
 violations 按两比率、三 p95 的固定顺序仅列严格大于阈值的指标，达标为 []。
 汇总不参与游标、不改任何既有输出；严格模式证明失败仍在发布前抛
 ProofVerificationError，不写汇总。省略这对参数时行为与旧版完全一致。
+
+可选的链级时间窗口趋势画像（``trend_window_ms`` 与 ``trend_output`` 成对
+给出）在报告、检查点、连续性盘点、链级延迟画像、延迟越界清单、链级 SLO
+汇总均安全发布后最后原子写出：窗口宽度 N 仅接受大于等于 1 的整数毫秒，
+其他值不合规（API 抛 InvalidInputError，CLI 为 InvalidArgument/退出码 2）。
+UTF-8 JSONL 按现有规则校验结构与证明、计算三段延迟并归因后，再按
+finalized_at 分窗口——window_start_ms 取不大于 finalized_at 的最大 N 的
+整数倍，按 chain_id 与该起点合并，空窗口不输出；按链首次出现、链内窗口
+起点升序。每行字段为 chain_id、window_start_ms、event_count、
+proof_failure_count、attribution_counts（仅含 source、relay、destination）
+与 latency_p95_ms（仅含 proof_latency_ms、relay_latency_ms、
+destination_latency_ms，三个 p95 各对窗口事件取最近秩
+max(1,ceil(0.95*n))）。画像覆盖当前输入全部结构合法事件而非游标后的新行，
+故续传、追加、重复执行结果一致，空输入原子写空文件。隔离模式下成功与失败
+都计 event_count，失败另计 proof_failure_count，延迟归因与成功行同口径；
+严格模式证明失败仍在发布前抛 ProofVerificationError，不写趋势文件。两参数
+缺一对（API）同样抛 InvalidInputError；省略这对参数时行为与旧版完全一致。
 """
 
 from __future__ import annotations
@@ -1315,6 +1332,79 @@ def _build_chain_health(
 
 
 # --------------------------------------------------------------------------- #
+# 链级时间窗口趋势画像
+# --------------------------------------------------------------------------- #
+def _build_trend_windows(
+    events: list[dict],
+    window_ms: int,
+    tolerate_failures: bool,
+) -> list[dict]:
+    """按 chain_id 与 finalized_at 所属时间窗口汇总趋势，覆盖整个当前输入。
+
+    window_start_ms 取不大于 finalized_at 的最大 window_ms 整数倍（Python
+    地板除对负时间戳同样得到不大于该时刻的起点），按 (chain_id, 起点) 合并；
+    没有事件落入的空窗口不输出。行按链在输入中首次出现、链内窗口起点升序。
+
+    每个结构合法事件都计入窗口 event_count 并贡献三段延迟（口径与延迟画像
+    一致）。隔离模式（tolerate_failures=True）下证明失败的事件另计
+    proof_failure_count 且仍贡献归因与 p95；严格模式分类时遇到证明失败直接
+    抛 ProofVerificationError。三个 p95 取最近秩 max(1,ceil(0.95*n))。
+    """
+    # 外层 dict 按链首次出现插入；内层按窗口起点收集，输出前再按起点排序。
+    by_chain: dict[str, dict[int, dict]] = {}
+    for event in events:
+        try:
+            verify_proof(event)
+        except ProofVerificationError:
+            if not tolerate_failures:
+                raise
+            failed = True
+        else:
+            failed = False
+
+        chain = event["chain_id"]
+        start = (event["finalized_at"] // window_ms) * window_ms
+        windows = by_chain.setdefault(chain, {})
+        bucket = windows.get(start)
+        if bucket is None:
+            bucket = {
+                "event_count": 0,
+                "proof_failure_count": 0,
+                "attribution_counts": {
+                    name: 0 for name in ATTRIBUTION_FIELDS
+                },
+                **{name: [] for name in LATENCY_THRESHOLD_FIELDS},
+            }
+            windows[start] = bucket
+        bucket["event_count"] += 1
+        if failed:
+            bucket["proof_failure_count"] += 1
+        latency = _latency_fields(event)
+        bucket["attribution_counts"][latency["attribution"]] += 1
+        for name in LATENCY_THRESHOLD_FIELDS:
+            bucket[name].append(latency[name])
+
+    rows: list[dict] = []
+    for chain, windows in by_chain.items():
+        for start in sorted(windows):
+            bucket = windows[start]
+            rows.append(
+                {
+                    "chain_id": chain,
+                    "window_start_ms": start,
+                    "event_count": bucket["event_count"],
+                    "proof_failure_count": bucket["proof_failure_count"],
+                    "attribution_counts": dict(bucket["attribution_counts"]),
+                    "latency_p95_ms": {
+                        name: _nearest_rank(sorted(bucket[name]), 0.95)
+                        for name in LATENCY_THRESHOLD_FIELDS
+                    },
+                }
+            )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -1340,6 +1430,8 @@ def watch(
     latency_profile_output: Optional[PathLike] = None,
     chain_slo_thresholds: Optional[PathLike] = None,
     chain_health_output: Optional[PathLike] = None,
+    trend_window_ms: Optional[int] = None,
+    trend_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -1402,6 +1494,17 @@ def watch(
     隔离模式 proof_status=failed 的事件计入失败率与 p95，严格模式证明失败
     仍在任何发布前抛 ProofVerificationError，不写汇总。省略这对参数时行为
     与旧版完全一致。
+
+    同时（且必须成对）给出 ``trend_window_ms`` 与 ``trend_output`` 时，在
+    报告、检查点、连续性盘点、链级延迟画像、延迟越界清单、链级 SLO 汇总都
+    安全发布后，最后再原子写出一份链级时间窗口趋势画像（UTF-8 JSONL；详见
+    :func:`_build_trend_windows`）。窗口宽度只接受大于等于 1 的整数毫秒，
+    其他值（None 除外，它表示未给出）与两参数缺一对都抛 InvalidInputError；
+    趋势覆盖当前输入全部结构合法事件而非游标后的新行，按 chain_id 首次出现
+    顺序、链内 window_start_ms 升序，空窗口不输出，空输入写空文件；隔离模式
+    proof_status=failed 的事件计入 event_count、proof_failure_count 与延迟
+    p95，严格模式证明失败仍在任何发布前抛 ProofVerificationError，不写趋势
+    文件。省略这对参数时行为与旧版完全一致。
     """
     if (latency_thresholds is None) != (latency_breach_output is None):
         raise InvalidInputError(
@@ -1412,6 +1515,17 @@ def watch(
         raise InvalidInputError(
             "chain_slo_thresholds and chain_health_output must be given "
             "together"
+        )
+    if (trend_window_ms is None) != (trend_output is None):
+        raise InvalidInputError(
+            "trend_window_ms and trend_output must be given together"
+        )
+    if trend_window_ms is not None and (
+        not _is_int(trend_window_ms) or trend_window_ms < 1
+    ):
+        raise InvalidInputError(
+            "trend_window_ms must be an integer number of milliseconds "
+            "greater than or equal to 1"
         )
 
     # 阈值是额外输入：在任何发布之前先加载并校验，使不合规阈值与结构非法
@@ -1465,6 +1579,16 @@ def watch(
         assert chain_slo is not None
         chain_health_rows = _build_chain_health(
             events, chain_slo, tolerate_failures
+        )
+
+    # 趋势画像同为最后发布、但结果在任何发布之前由全部结构合法事件算好：
+    # 严格模式下（含游标覆盖的历史事件中存在证明失败的续传场景）在此即抛
+    # ProofVerificationError，绝不先写任何既有输出再失败。
+    trend_rows: Optional[list[dict]] = None
+    if trend_output is not None:
+        assert trend_window_ms is not None
+        trend_rows = _build_trend_windows(
+            events, trend_window_ms, tolerate_failures
         )
 
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
@@ -1535,6 +1659,12 @@ def watch(
             chain_health_output, _render_reports(chain_health_rows)
         )
 
+    # 链级时间窗口趋势画像最后发布：结果已在任何发布之前由全部结构合法事件
+    # 算好（含隔离模式的失败行），与游标无关，故空批（无新事件）也照常写出
+    # 同一内容，空输入原子写空文件；此处只负责最后一次原子替换。
+    if trend_output is not None:
+        _atomic_write(trend_output, _render_reports(trend_rows))
+
     return reports
 
 
@@ -1549,6 +1679,8 @@ def run(
     latency_profile_output: Optional[PathLike] = None,
     chain_slo_thresholds: Optional[PathLike] = None,
     chain_health_output: Optional[PathLike] = None,
+    trend_window_ms: Optional[int] = None,
+    trend_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
@@ -1562,7 +1694,12 @@ def run(
     ``chain_slo_thresholds`` 与 ``chain_health_output`` 成对给定时最后原子
     写出链级 SLO 汇总（每链一行的两比率、三 p95 与 violations，口径见
     :func:`watch`、:func:`_build_chain_health` 与
-    :func:`load_chain_slo_thresholds`）。
+    :func:`load_chain_slo_thresholds`）；
+    ``trend_window_ms`` 与 ``trend_output`` 成对给定时在所有既有输出安全
+    发布后最后原子写出链级时间窗口趋势画像（按 chain_id 与 finalized_at
+    分窗口，字段、p95 与失败计数口径见 :func:`watch` 与
+    :func:`_build_trend_windows`）；窗口宽度必须是大于等于 1 的整数毫秒，
+    不合规或两参数缺一对抛 InvalidInputError。
     """
     return watch(
         input,
@@ -1575,4 +1712,6 @@ def run(
         latency_profile_output,
         chain_slo_thresholds,
         chain_health_output,
+        trend_window_ms,
+        trend_output,
     )

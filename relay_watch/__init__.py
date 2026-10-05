@@ -73,19 +73,40 @@ missing_count)*1000)，missing_count 口径同连续性盘点）、latency_p95_m
 都不写。汇总不参与游标、不改既有输出；省略这对参数时既有结果不变，路径
 不可写等文件错误沿用 CLI 的 OSError 子类固定 JSON 错误与非零退出。
 
+可选的链级时间窗口趋势画像（``trend_window_ms`` 与 ``trend_output`` /
+``--trend-window-ms`` 与 ``--trend-output``，必须成对给出）在报告、检查
+点、连续性盘点、延迟画像、延迟越界清单、链级 SLO 汇总均安全发布后最后
+原子写出。窗口宽度 N 仅接受大于等于 1 的整数毫秒，其他值不合规（API 抛
+InvalidInputError；CLI 对缺参、未知参数、语法或宽度错误输出固定
+InvalidArgument JSON、退出码 2）。画像为 UTF-8 JSONL：事件先按现有规则
+校验结构与证明、计算三段延迟并归因，再按 finalized_at 分窗口，
+window_start_ms 取不大于 finalized_at 的最大 N 的整数倍，按 chain_id 与
+该起点合并，空窗口不输出；行按链首次出现、链内窗口起点升序。每行字段为
+chain_id、window_start_ms、event_count、proof_failure_count、
+attribution_counts（仅含 source、relay、destination，未出现写 0）与
+latency_p95_ms（仅含 proof_latency_ms、relay_latency_ms、
+destination_latency_ms，三个 p95 各对窗口事件取最近秩
+max(1,ceil(0.95*n))）。画像覆盖当前输入全部结构合法事件而非游标后的新
+行，续传、追加、重复执行结果一致，空输入原子写空文件。隔离模式下成功与
+失败都计 event_count，失败另计 proof_failure_count，延迟归因同口径；严格
+模式证明失败仍抛 ProofVerificationError，不写趋势文件。省略这对参数时既
+有结果不变；趋势路径不可写沿用 CLI 的 OSError 子类固定 JSON 错误与非零
+退出。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
   tolerate_failures=False, continuity_output=None,
   latency_thresholds=None, latency_breach_output=None,
   latency_profile_output=None, chain_slo_thresholds=None,
-  chain_health_output=None)`` -> list[dict]
-  与命令行同参的模块 API；
+  chain_health_output=None, trend_window_ms=None, trend_output=None)``
+  -> list[dict] 与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
   [--continuity-output PATH] [--tolerate-failures [{true,false}]]
   [--latency-thresholds PATH --latency-breach-output PATH]
   [--latency-profile-output PATH]
-  [--chain-slo-thresholds PATH --chain-health-output PATH]``；
+  [--chain-slo-thresholds PATH --chain-health-output PATH]
+  [--trend-window-ms N --trend-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 
