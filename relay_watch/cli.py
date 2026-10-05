@@ -4,6 +4,7 @@ relay-watch --input IN --checkpoint CP --output OUT
     [--continuity-output PATH] [--tolerate-failures [{true,false}]]
     [--latency-thresholds PATH --latency-breach-output PATH]
     [--latency-profile-output PATH]
+    [--chain-slo-thresholds PATH --chain-health-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -145,6 +146,35 @@ def build_parser() -> argparse.ArgumentParser:
             "省略时不生成"
         ),
     )
+    parser.add_argument(
+        "--chain-slo-thresholds",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：链级 SLO 阈值 UTF-8 JSON 文件路径，对象仅含 "
+            "proof_failure_rate_permille、missing_sequence_rate_permille"
+            "（均为 0 到 1000 的整数）与 proof_latency_ms_p95、"
+            "relay_latency_ms_p95、destination_latency_ms_p95（均为非负"
+            "整数毫秒）。必须与 --chain-health-output 成对给出"
+        ),
+    )
+    parser.add_argument(
+        "--chain-health-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：链级 SLO 汇总输出路径（报告、检查点、连续性盘点、延迟"
+            "画像、延迟越界清单都安全发布后最后原子替换的 UTF-8 JSONL）。"
+            "按 chain_id 首次出现顺序每链一行，覆盖当前输入全部结构合法"
+            "事件而非游标后的新行，空输入写空文件；字段为 chain_id、"
+            "event_count、proof_failure_rate_permille、"
+            "missing_sequence_rate_permille、latency_p95_ms（三个整数键 "
+            "proof_latency_ms、relay_latency_ms、destination_latency_ms，"
+            "p95 取最近秩）与 violations（按两比率、三 p95 顺序仅列严格"
+            "大于阈值项，达标为 []）。隔离模式 proof_status=failed 的事件"
+            "计入失败率与 p95；省略时不生成"
+        ),
+    )
     return parser
 
 
@@ -162,6 +192,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "given together"
         )
 
+    # 链级 SLO 两参数同样必须成对，错误口径与延迟越界参数一致。
+    if (args.chain_slo_thresholds is None) != (
+        args.chain_health_output is None
+    ):
+        parser.error(
+            "--chain-slo-thresholds and --chain-health-output must be "
+            "given together"
+        )
+
     try:
         run(
             args.input,
@@ -172,6 +211,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             latency_thresholds=args.latency_thresholds,
             latency_breach_output=args.latency_breach_output,
             latency_profile_output=args.latency_profile_output,
+            chain_slo_thresholds=args.chain_slo_thresholds,
+            chain_health_output=args.chain_health_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

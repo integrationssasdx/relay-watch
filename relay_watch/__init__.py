@@ -54,17 +54,38 @@ destination_latency_ms（三个延迟对象仅含 min、p50、p95、max，p50/p9
 严格模式证明失败仍抛 ProofVerificationError，报告、检查点、连续性盘点、
 延迟越界清单和画像都不写；领域错误不生成画像，省略该参数时既有结果不变。
 
+可选的链级 SLO 汇总（``chain_slo_thresholds`` 与 ``chain_health_output`` /
+``--chain-slo-thresholds`` 与 ``--chain-health-output``，必须成对给出）在
+报告、检查点、连续性盘点、延迟画像、延迟越界清单均安全发布后最后原子
+写出。阈值文件为 UTF-8 JSON 对象，仅含 proof_failure_rate_permille、
+missing_sequence_rate_permille（均为 0 到 1000 的整数）与
+proof_latency_ms_p95、relay_latency_ms_p95、destination_latency_ms_p95
+（均为非负整数毫秒），字段或值不合规抛 InvalidInputError。汇总为 UTF-8
+JSONL，按 chain_id 首次出现顺序每链一行，覆盖当前输入全部结构合法事件
+而非游标后的新行，空输入写空文件。行字段为 chain_id、event_count、
+proof_failure_rate_permille（ceil(失败数/事件数*1000)）、
+missing_sequence_rate_permille（ceil(missing_count/(event_count+
+missing_count)*1000)，missing_count 口径同连续性盘点）、latency_p95_ms
+（三个整数键 proof_latency_ms、relay_latency_ms、destination_latency_ms，
+取链级延迟画像同口径最近秩 p95）与 violations（按两比率、三 p95 顺序仅
+列严格大于阈值的指标名，达标为 []）。隔离模式 proof_status=failed 的事件
+计入失败率与 p95；严格模式证明失败仍抛 ProofVerificationError，任何输出
+都不写。汇总不参与游标、不改既有输出；省略这对参数时既有结果不变，路径
+不可写等文件错误沿用 CLI 的 OSError 子类固定 JSON 错误与非零退出。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
   tolerate_failures=False, continuity_output=None,
   latency_thresholds=None, latency_breach_output=None,
-  latency_profile_output=None)`` -> list[dict]
+  latency_profile_output=None, chain_slo_thresholds=None,
+  chain_health_output=None)`` -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
   [--continuity-output PATH] [--tolerate-failures [{true,false}]]
   [--latency-thresholds PATH --latency-breach-output PATH]
-  [--latency-profile-output PATH]``；
+  [--latency-profile-output PATH]
+  [--chain-slo-thresholds PATH --chain-health-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

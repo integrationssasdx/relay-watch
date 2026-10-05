@@ -3923,3 +3923,847 @@ def test_cli_profile_empty_input_writes_empty_file(workspace):
     assert result.returncode == 0, result.stderr
     assert profile.exists()
     assert profile.read_text(encoding="utf-8") == ""
+
+# ---------------------------------------------------------------------------
+# Chain-level SLO summary (chain_slo_thresholds / chain_health_output)
+# --------------------------------------------------------------------------- #
+
+
+CHAIN_SLO_PATH_NAME = "health.jsonl"
+
+# Every metric exactly at its threshold: a healthy chain produces [].
+CHAIN_SLO_ZERO_THRESHOLDS = {
+    "proof_failure_rate_permille": 0,
+    "missing_sequence_rate_permille": 0,
+    "proof_latency_ms_p95": 0,
+    "relay_latency_ms_p95": 0,
+    "destination_latency_ms_p95": 0,
+}
+
+
+def read_health(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def write_slo(path, payload):
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def run_slo(workspace, thresholds=CHAIN_SLO_ZERO_THRESHOLDS, **kwargs):
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    slo_path = workspace["output"].with_name("slo.json")
+    write_slo(slo_path, thresholds)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+        **kwargs,
+    )
+    return reports, health
+
+
+def test_chain_health_single_chain_rates_p95_and_violations(workspace):
+    # 3 verified events, sequences 1/3/4 -> one missing sequence (2).
+    # proof latencies 100/400/200 -> p95 nearest rank ceil(2.85)=3 -> 400
+    # relay latencies 500/600/700 -> p95 700
+    # destination latencies 50/90/20 -> p95 90
+    events = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 3, "A3", 2_000_000, 400, 600, 90),
+        latency_event("chain-a", 4, "A4", 3_000_000, 200, 700, 20),
+    ]
+    write_events(workspace["input"], events)
+    thresholds = {
+        "proof_failure_rate_permille": 0,
+        "missing_sequence_rate_permille": 100,   # 250 violates
+        "proof_latency_ms_p95": 399,             # 400 violates
+        "relay_latency_ms_p95": 700,             # equal -> no violation
+        "destination_latency_ms_p95": 90,        # equal -> no violation
+    }
+
+    _reports, health = run_slo(workspace, thresholds)
+
+    assert read_health(health) == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "proof_failure_rate_permille": 0,
+            # ceil(1 / 4 * 1000) = 250
+            "missing_sequence_rate_permille": 250,
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 700,
+                "destination_latency_ms": 90,
+            },
+            "violations": [
+                "missing_sequence_rate_permille",
+                "proof_latency_ms_p95",
+            ],
+        }
+    ]
+    row = read_health(health)[0]
+    assert set(row) == {
+        "chain_id",
+        "event_count",
+        "proof_failure_rate_permille",
+        "missing_sequence_rate_permille",
+        "latency_p95_ms",
+        "violations",
+    }
+    assert set(row["latency_p95_ms"]) == {
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+    }
+
+
+def test_chain_health_failure_rate_counts_failed_rows_in_isolation(workspace):
+    # three_mixed_events: verified, failed, verified -> 1/3 failure.
+    # ceil(1 / 3 * 1000) = 334; no sequence gaps.
+    write_events(workspace["input"], three_mixed_events())
+    thresholds = {
+        "proof_failure_rate_permille": 333,
+        "missing_sequence_rate_permille": 1000,
+        "proof_latency_ms_p95": 10_000,
+        "relay_latency_ms_p95": 10_000,
+        "destination_latency_ms_p95": 10_000,
+    }
+
+    _reports, health = run_slo(
+        workspace, thresholds, tolerate_failures=True
+    )
+
+    rows = read_health(health)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "proof_failure_rate_permille": 334,
+            "missing_sequence_rate_permille": 0,
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+            "violations": ["proof_failure_rate_permille"],
+        }
+    ]
+
+
+def test_chain_health_all_failing_rate_is_one_thousand(workspace):
+    events = [
+        isolated_event("chain-a", 1, "A1", 1000, failing=True),
+        isolated_event("chain-a", 2, "A2", 2000, failing=True),
+    ]
+    write_events(workspace["input"], events)
+    thresholds = dict(CHAIN_SLO_ZERO_THRESHOLDS)
+    thresholds["proof_failure_rate_permille"] = 999
+
+    _reports, health = run_slo(
+        workspace, thresholds, tolerate_failures=True
+    )
+
+    row = read_health(health)[0]
+    assert row["proof_failure_rate_permille"] == 1000
+    assert row["violations"] == [
+        "proof_failure_rate_permille",
+        "proof_latency_ms_p95",
+        "relay_latency_ms_p95",
+        "destination_latency_ms_p95",
+    ]
+
+
+def test_chain_health_rate_one_thousand_is_inclusive_bound(workspace):
+    write_events(workspace["input"], [make_event()])
+    thresholds = {
+        "proof_failure_rate_permille": 1000,
+        "missing_sequence_rate_permille": 1000,
+        "proof_latency_ms_p95": 10_000,
+        "relay_latency_ms_p95": 10_000,
+        "destination_latency_ms_p95": 10_000,
+    }
+    _reports, health = run_slo(workspace, thresholds)
+    # Verified single event: rate 0, missing 0, latencies below thresholds.
+    assert read_health(health)[0]["violations"] == []
+
+
+def test_chain_health_failure_rate_rounds_up_not_to_nearest(workspace):
+    # 1 failure out of 200 events -> 5 permille exactly; build 1 failed + 199
+    # verified with unique time blocks. Assert ceil via 1/3 = 334 (not 333).
+    events = [
+        isolated_event("chain-a", 2, "A2", 2_000_000, failing=True),
+        isolated_event("chain-a", 1, "A1", 1_000_000),
+        isolated_event("chain-a", 3, "A3", 3_000_000),
+    ]
+    write_events(workspace["input"], events)
+    thresholds = {
+        "proof_failure_rate_permille": 1000,
+        "missing_sequence_rate_permille": 1000,
+        "proof_latency_ms_p95": 10_000,
+        "relay_latency_ms_p95": 10_000,
+        "destination_latency_ms_p95": 10_000,
+    }
+    _reports, health = run_slo(
+        workspace, thresholds, tolerate_failures=True
+    )
+    assert read_health(health)[0]["proof_failure_rate_permille"] == 334
+
+
+def test_chain_health_missing_rate_uses_gaps_only_and_rounds_up(workspace):
+    # Sequences 1, 4 -> 2 missing (2, 3); rate = ceil(2 / 4 * 1000) = 500.
+    events = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 4, "A4", 2_000_000, 400, 600, 90),
+    ]
+    write_events(workspace["input"], events)
+    thresholds = {
+        "proof_failure_rate_permille": 1000,
+        "missing_sequence_rate_permille": 499,
+        "proof_latency_ms_p95": 10_000,
+        "relay_latency_ms_p95": 10_000,
+        "destination_latency_ms_p95": 10_000,
+    }
+    _reports, health = run_slo(workspace, thresholds)
+    row = read_health(health)[0]
+    assert row["missing_sequence_rate_permille"] == 500
+    assert row["violations"] == ["missing_sequence_rate_permille"]
+
+
+def test_chain_health_p95_uses_nearest_rank(workspace):
+    # 20 events, proof latencies 10..200 ms: nearest-rank p95 is rank 19 -> 190.
+    events = [
+        latency_event(
+            "chain-a", i, f"A{i}", (i + 1) * 10_000_000,
+            proof=i * 10, relay=100, destination=5,
+        )
+        for i in range(1, 21)
+    ]
+    write_events(workspace["input"], events)
+    thresholds = {
+        "proof_failure_rate_permille": 1000,
+        "missing_sequence_rate_permille": 1000,
+        "proof_latency_ms_p95": 189,     # 190 violates (not the max 200)
+        "relay_latency_ms_p95": 100,    # equal -> fine
+        "destination_latency_ms_p95": 5,
+    }
+    _reports, health = run_slo(workspace, thresholds)
+    row = read_health(health)[0]
+    assert row["latency_p95_ms"]["proof_latency_ms"] == 190
+    assert row["violations"] == ["proof_latency_ms_p95"]
+
+
+def test_chain_health_multichain_first_appearance_order(workspace):
+    # chain-b appears first; both chains reuse sequences 1 and 2.
+    events = [
+        latency_event("chain-b", 1, "B1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 1, "A1", 2_000_000, 400, 600, 90),
+        latency_event("chain-b", 2, "B2", 3_000_000, 300, 700, 20),
+        latency_event("chain-a", 2, "A2", 4_000_000, 200, 800, 70),
+    ]
+    write_events(workspace["input"], events)
+    _reports, health = run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+
+    rows = read_health(health)
+    assert [r["chain_id"] for r in rows] == ["chain-b", "chain-a"]
+    assert [r["event_count"] for r in rows] == [2, 2]
+
+
+def test_chain_health_equal_threshold_is_not_a_violation(workspace):
+    # Latencies are exactly 400/500/90; p95 of one event equals that value.
+    write_events(workspace["input"], [make_event()])
+    thresholds = {
+        "proof_failure_rate_permille": 0,
+        "missing_sequence_rate_permille": 0,
+        "proof_latency_ms_p95": 400,
+        "relay_latency_ms_p95": 500,
+        "destination_latency_ms_p95": 900,
+    }
+    _reports, health = run_slo(workspace, thresholds)
+    assert read_health(health)[0]["violations"] == []
+
+
+def test_chain_health_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    _reports, health = run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    assert health.exists()
+    assert health.read_text(encoding="utf-8") == ""
+
+
+def test_chain_health_omitted_writes_nothing_and_behavior_unchanged(workspace):
+    write_events(workspace["input"], three_events())
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert not health.exists()
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_chain_health_covers_whole_input_across_resume(workspace):
+    # First run processes seq 1 and 4 (gap 2,3); an appended rerun selects only
+    # seq 7, yet the summary covers all three events.
+    first_batch = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 400, 500, 400),
+        latency_event("chain-a", 4, "A4", 2_000_000, 400, 500, 400),
+    ]
+    write_events(workspace["input"], first_batch)
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    slo_path = workspace["output"].with_name("slo.json")
+    write_slo(
+        slo_path,
+        {
+            "proof_failure_rate_permille": 1000,
+            "missing_sequence_rate_permille": 1000,
+            "proof_latency_ms_p95": 10_000,
+            "relay_latency_ms_p95": 10_000,
+            "destination_latency_ms_p95": 10_000,
+        },
+    )
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+    )
+    assert read_health(health)[0]["event_count"] == 2
+
+    second_batch = first_batch + [
+        latency_event("chain-a", 7, "A7", 3_000_000, 400, 500, 400)
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+    )
+    assert [r["sequence"] for r in reports] == [7]
+    row = read_health(health)[0]
+    assert row["event_count"] == 3
+    # Gaps are 2,3 and 5,6 -> 4 missing; ceil(4 / 7 * 1000) = 572.
+    assert row["missing_sequence_rate_permille"] == 572
+
+    # A no-op rerun rewrites the identical summary.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+    )
+    assert again == []
+    assert read_health(health)[0] == row
+
+
+def test_chain_health_atomically_replaces_stale_file(workspace):
+    write_events(workspace["input"], [make_event()])
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    health.write_text("STALE\n", encoding="utf-8")
+    _reports, health2 = run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    rows = read_health(health2)
+    assert len(rows) == 1
+    assert rows[0]["chain_id"] == "chain-7"
+
+
+def test_chain_health_does_not_change_report_checkpoint_profile_or_breach(
+    workspace,
+):
+    write_events(workspace["input"], [make_event()])
+    thresholds_path = workspace["output"].with_name("thresholds.json")
+    breach = workspace["output"].with_name("breach.jsonl")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    write_thresholds(thresholds_path, DEFAULT_THRESHOLDS)
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds_path,
+        latency_breach_output=breach,
+        latency_profile_output=profile,
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+    )
+
+    row = json.loads(workspace["output"].read_text().splitlines()[0])
+    assert set(row) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+        "attribution",
+        "finalized_at",
+    }
+    assert set(read_checkpoint(workspace)) == {
+        "schema_version",
+        "last_sequence_by_chain",
+        "processed_lines",
+        "input_prefix_sha256",
+    }
+    assert len(read_breaches(breach)) == 1
+    assert len(read_profile(profile)) == 1
+    assert len(read_health(health)) == 1
+
+
+def test_chain_health_arguments_must_be_paired_in_api(workspace):
+    write_events(workspace["input"], [make_event()])
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            chain_slo_thresholds=slo_path,
+        )
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            chain_health_output=health,
+        )
+    assert not health.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "nope",                                       # malformed JSON
+        "[]",                                         # not an object
+        "{}",                                         # missing all fields
+        json.dumps(                                    # missing one field
+            {
+                "proof_failure_rate_permille": 1,
+                "missing_sequence_rate_permille": 1,
+                "proof_latency_ms_p95": 1,
+                "relay_latency_ms_p95": 1,
+            }
+        ),
+        json.dumps(                                    # unknown field
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+                "extra": 1,
+            }
+        ),
+        json.dumps(                                    # rate above 1000
+            {
+                "proof_failure_rate_permille": 1001,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # rate negative
+            {
+                "proof_failure_rate_permille": -1,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # rate float
+            {
+                "proof_failure_rate_permille": 1.5,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # rate boolean
+            {
+                "proof_failure_rate_permille": True,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # rate null
+            {
+                "proof_failure_rate_permille": None,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # rate string
+            {
+                "proof_failure_rate_permille": "0",
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # p95 negative
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": -1,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # p95 float
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": 1.5,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # p95 boolean
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": False,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # p95 null
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 0,
+                "proof_latency_ms_p95": None,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+        json.dumps(                                    # missing-rate above 1000
+            {
+                "proof_failure_rate_permille": 0,
+                "missing_sequence_rate_permille": 1001,
+                "proof_latency_ms_p95": 0,
+                "relay_latency_ms_p95": 0,
+                "destination_latency_ms_p95": 0,
+            }
+        ),
+    ],
+)
+def test_chain_slo_invalid_thresholds_raise_invalid_input(workspace, payload):
+    write_events(workspace["input"], [make_event()])
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, payload)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            chain_slo_thresholds=slo_path,
+            chain_health_output=health,
+        )
+    assert not health.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_chain_slo_boundary_values_are_valid(workspace):
+    # 0 and 1000 for rates, 0 for p95 must all be accepted.
+    write_events(workspace["input"], [make_event()])
+    _reports, health = run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    assert health.exists()
+
+
+def test_chain_slo_invalid_utf8_thresholds_raise_invalid_input(workspace):
+    write_events(workspace["input"], [make_event()])
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    slo_path.write_bytes(b"\xff\xfe{")
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            chain_slo_thresholds=slo_path,
+            chain_health_output=health,
+        )
+    assert not health.exists()
+
+
+def test_chain_health_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    with pytest.raises(ProofVerificationError):
+        run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    assert not health.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_chain_health_invalid_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    with pytest.raises(InvalidInputError):
+        run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    assert not workspace["output"].with_name(CHAIN_SLO_PATH_NAME).exists()
+
+
+def test_chain_health_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    with pytest.raises(CheckpointError):
+        run_slo(workspace, CHAIN_SLO_ZERO_THRESHOLDS)
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    assert not health.exists()
+    assert not workspace["output"].exists()
+
+
+def test_chain_health_failed_rows_participate_in_p95(workspace):
+    # All three events share the 400/500/400 latency block; the failed middle
+    # row must still contribute to the p95 values.
+    write_events(workspace["input"], three_mixed_events())
+    thresholds = {
+        "proof_failure_rate_permille": 1000,
+        "missing_sequence_rate_permille": 1000,
+        "proof_latency_ms_p95": 399,
+        "relay_latency_ms_p95": 499,
+        "destination_latency_ms_p95": 399,
+    }
+    _reports, health = run_slo(
+        workspace, thresholds, tolerate_failures=True
+    )
+    row = read_health(health)[0]
+    assert row["latency_p95_ms"] == {
+        "proof_latency_ms": 400,
+        "relay_latency_ms": 500,
+        "destination_latency_ms": 400,
+    }
+    assert row["violations"] == [
+        "proof_latency_ms_p95",
+        "relay_latency_ms_p95",
+        "destination_latency_ms_p95",
+    ]
+
+
+def test_cli_chain_health_output_success(workspace):
+    write_events(workspace["input"], [make_event()])
+    slo = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo, CHAIN_SLO_ZERO_THRESHOLDS)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = read_health(health)
+    assert len(rows) == 1
+    assert rows[0]["chain_id"] == "chain-7"
+    assert rows[0]["proof_failure_rate_permille"] == 0
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--chain-slo-thresholds", "slo.json"],
+        ["--chain-health-output", "health.jsonl"],
+    ],
+)
+def test_cli_chain_slo_arguments_must_be_paired(workspace, extra_args):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        *extra_args,
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] == "InvalidArgument"
+    assert not workspace["output"].exists()
+
+
+def test_cli_chain_slo_invalid_thresholds_is_invalid_input_error(workspace):
+    write_events(workspace["input"], [make_event()])
+    slo = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    slo.write_text("nope", encoding="utf-8")
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "InvalidInputError"
+    assert not health.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_chain_slo_missing_thresholds_file_is_oserror(workspace):
+    write_events(workspace["input"], [make_event()])
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(workspace["output"].with_name("missing.json")),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "FileNotFoundError"
+    assert isinstance(payload["message"], str) and payload["message"]
+    assert not health.exists()
+
+
+def test_cli_chain_health_unwritable_output_is_oserror_json(workspace):
+    write_events(workspace["input"], [make_event()])
+    slo = workspace["output"].with_name("slo.json")
+    write_slo(slo, CHAIN_SLO_ZERO_THRESHOLDS)
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    health = blocked / CHAIN_SLO_PATH_NAME
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+    # The summary is published last: every earlier artifact already exists.
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+
+
+def test_cli_chain_health_strict_failure_leaves_no_health_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    slo = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo, CHAIN_SLO_ZERO_THRESHOLDS)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not health.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_chain_health_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    slo = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo, CHAIN_SLO_ZERO_THRESHOLDS)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode == 0, result.stderr
+    assert health.exists()
+    assert health.read_text(encoding="utf-8") == ""
+
+
+def test_cli_chain_health_isolation_mode_counts_failed_rows(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    slo = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(
+        slo,
+        {
+            "proof_failure_rate_permille": 1000,
+            "missing_sequence_rate_permille": 1000,
+            "proof_latency_ms_p95": 10_000,
+            "relay_latency_ms_p95": 10_000,
+            "destination_latency_ms_p95": 10_000,
+        },
+    )
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+        "--chain-slo-thresholds", str(slo),
+        "--chain-health-output", str(health),
+    )
+    assert result.returncode == 0, result.stderr
+    rows = read_health(health)
+    assert len(rows) == 1
+    assert rows[0]["event_count"] == 3
+    assert rows[0]["proof_failure_rate_permille"] == 334
+
+
+def test_chain_health_strict_rerun_over_isolated_history_raises_before_publish(
+    workspace,
+):
+    # First run in isolation mode commits a failed row and advances the cursor.
+    write_events(workspace["input"], three_mixed_events())
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+    )
+    output_before = workspace["output"].read_text()
+    health_before = health.read_text()
+
+    # A later STRICT run (even with nothing newly selected) must surface the
+    # historically failed proof before publishing anything: it raises and must
+    # not replace the previously published report or chain health summary.
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=False,
+            chain_slo_thresholds=slo_path,
+            chain_health_output=health,
+        )
+    assert health.read_text() == health_before
+    # The previously published report is left untouched on the failure.
+    assert workspace["output"].read_text() == output_before
