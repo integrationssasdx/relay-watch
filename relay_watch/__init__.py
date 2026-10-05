@@ -42,15 +42,29 @@ proof_status、breached_stages、attribution、finalized_at。隔离模式的失
 ProofVerificationError，不写清单。无越界或无新事件写空文件；省略这对参数
 时行为与旧版完全一致。
 
+可选的链级延迟画像（``latency_profile_output`` /
+``--latency-profile-output``）在报告、检查点、已启用的连续性盘点均安全
+发布后、延迟越界清单之前原子写出：UTF-8 JSONL，按 chain_id 首次出现顺序
+每链一行，覆盖当前输入全部结构合法事件而非游标后的新行，空输入写空文件。
+行字段为 chain_id、event_count、proof_latency_ms、relay_latency_ms、
+destination_latency_ms（三个延迟对象仅含 min、p50、p95、max，p50/p95 用
+最近秩，秩为 max(1,ceil(0.50*n))、max(1,ceil(0.95*n))，单事件四项相同）
+与 attribution_counts（仅含 source、relay、destination，按现有归因计数，
+未出现写 0）。隔离模式 proof_status=failed 的事件与 verified 一起统计；
+严格模式证明失败仍抛 ProofVerificationError，报告、检查点、连续性盘点、
+延迟越界清单和画像都不写；领域错误不生成画像，省略该参数时既有结果不变。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
   tolerate_failures=False, continuity_output=None,
-  latency_thresholds=None, latency_breach_output=None)`` -> list[dict]
+  latency_thresholds=None, latency_breach_output=None,
+  latency_profile_output=None)`` -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
   [--continuity-output PATH] [--tolerate-failures [{true,false}]]
-  [--latency-thresholds PATH --latency-breach-output PATH]``；
+  [--latency-thresholds PATH --latency-breach-output PATH]
+  [--latency-profile-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

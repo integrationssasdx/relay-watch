@@ -16,7 +16,11 @@ from relay_watch import (
     ProofVerificationError,
     run,
 )
-from relay_watch.core import _trusted_roots, _validator_set_hash
+from relay_watch.core import (
+    _trusted_roots,
+    _validator_set_hash,
+    _nearest_rank,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -3340,3 +3344,582 @@ def test_cli_breach_strict_failure_leaves_no_breach_file(workspace):
     assert json.loads(result.stderr)["error"] == "ProofVerificationError"
     assert not breach.exists()
     assert not workspace["output"].exists()
+
+
+# ---------------------------------------------------------------------------
+# Chain-level latency profile (latency_profile_output)
+# --------------------------------------------------------------------------- #
+
+
+def read_profile(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def latency_event(chain_id, sequence, event_id, base, proof, relay, destination):
+    """A verifiable event with exact proof/relay/destination latencies.
+
+    base values are spaced far apart (>= 1_000_000) so every timestamp column
+    stays globally unique even with sizeable latency offsets. The observed
+    instant is derived as verify - relay (it may sit anywhere relative to the
+    on-chain instants; only submit <= verify <= finalize is enforced).
+    """
+    submit = base + 100
+    verify = submit + proof
+    finalize = verify + destination
+    observed = verify - relay
+    return on_chain(
+        chain_id,
+        event_id=event_id,
+        sequence=sequence,
+        observed_at=observed,
+        proof_submitted_at=submit,
+        proof_verified_at=verify,
+        finalized_at=finalize,
+    )
+
+
+PROFILE_PATH_NAME = "profile.jsonl"
+
+
+def run_profile(workspace, events=None, **kwargs):
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    if events is not None:
+        write_events(workspace["input"], events)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_profile_output=profile,
+        **kwargs,
+    )
+    return reports, profile
+
+
+@pytest.mark.parametrize(
+    "n,quantile,expected_value",
+    [
+        (1, 0.50, 1),     # rank max(1, ceil(0.5)) = 1
+        (1, 0.95, 1),
+        (2, 0.50, 1),     # rank ceil(1.0) = 1 (smaller of the two)
+        (3, 0.50, 2),     # rank ceil(1.5) = 2
+        (4, 0.50, 2),
+        (20, 0.95, 19),   # rank ceil(19.0) = 19, not the maximum
+        (40, 0.95, 38),
+        (10, 0.95, 10),   # rank ceil(9.5) = 10
+    ],
+)
+def test_profile_nearest_rank(n, quantile, expected_value):
+    values = list(range(1, n + 1))
+    assert _nearest_rank(values, quantile) == expected_value
+
+
+def test_profile_single_chain_distribution_and_field_sets(workspace):
+    events = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 2, "A2", 2_000_000, 400, 600, 90),
+        latency_event("chain-a", 3, "A3", 3_000_000, 200, 700, 20),
+        latency_event("chain-a", 4, "A4", 4_000_000, 300, 800, 70),
+    ]
+    _reports, profile = run_profile(workspace, events)
+
+    rows = read_profile(profile)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 4,
+            "proof_latency_ms": {"min": 100, "p50": 200, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 500, "p50": 600, "p95": 800, "max": 800},
+            "destination_latency_ms": {
+                "min": 20,
+                "p50": 50,
+                "p95": 90,
+                "max": 90,
+            },
+            "attribution_counts": {"source": 0, "relay": 4, "destination": 0},
+        }
+    ]
+    assert set(rows[0]) == {
+        "chain_id",
+        "event_count",
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+        "attribution_counts",
+    }
+    for name in (
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+    ):
+        assert set(rows[0][name]) == {"min", "p50", "p95", "max"}
+    assert set(rows[0]["attribution_counts"]) == {
+        "source",
+        "relay",
+        "destination",
+    }
+
+
+def test_profile_p95_is_nearest_rank_not_max_at_n20(workspace):
+    events = [
+        latency_event(
+            "chain-a", i, f"A{i}", (i + 1) * 10_000_000,
+            proof=i * 10, relay=100, destination=5,
+        )
+        for i in range(1, 21)
+    ]
+    _reports, profile = run_profile(workspace, events)
+
+    rows = read_profile(profile)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_count"] == 20
+    # proof latencies are exactly 10..200 ms.
+    assert row["proof_latency_ms"] == {"min": 10, "p50": 100, "p95": 190, "max": 200}
+    # Constant columns collapse: all four stats coincide.
+    assert row["relay_latency_ms"] == {"min": 100, "p50": 100, "p95": 100, "max": 100}
+    assert row["destination_latency_ms"] == {"min": 5, "p50": 5, "p95": 5, "max": 5}
+
+
+def test_profile_single_event_four_stats_coincide(workspace):
+    _reports, profile = run_profile(workspace, [make_event()])
+
+    rows = read_profile(profile)
+    assert rows == [
+        {
+            "chain_id": "chain-7",
+            "event_count": 1,
+            "proof_latency_ms": {"min": 400, "p50": 400, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 500, "p50": 500, "p95": 500, "max": 500},
+            "destination_latency_ms": {
+                "min": 900,
+                "p50": 900,
+                "p95": 900,
+                "max": 900,
+            },
+            "attribution_counts": {"source": 0, "relay": 0, "destination": 1},
+        }
+    ]
+
+
+def test_profile_multichain_first_appearance_order_and_per_chain_stats(
+    workspace,
+):
+    # Both chains reuse sequences 1 and 2; chain-b appears first in line order.
+    events = [
+        latency_event("chain-b", 1, "B1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 1, "A1", 2_000_000, 400, 600, 90),
+        latency_event("chain-b", 2, "B2", 3_000_000, 300, 700, 20),
+        latency_event("chain-a", 2, "A2", 4_000_000, 200, 800, 70),
+    ]
+    _reports, profile = run_profile(workspace, events)
+
+    assert read_profile(profile) == [
+        {
+            "chain_id": "chain-b",
+            "event_count": 2,
+            "proof_latency_ms": {"min": 100, "p50": 100, "p95": 300, "max": 300},
+            "relay_latency_ms": {"min": 500, "p50": 500, "p95": 700, "max": 700},
+            "destination_latency_ms": {
+                "min": 20,
+                "p50": 20,
+                "p95": 50,
+                "max": 50,
+            },
+            "attribution_counts": {"source": 0, "relay": 2, "destination": 0},
+        },
+        {
+            "chain_id": "chain-a",
+            "event_count": 2,
+            "proof_latency_ms": {"min": 200, "p50": 200, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 600, "p50": 600, "p95": 800, "max": 800},
+            "destination_latency_ms": {
+                "min": 70,
+                "p50": 70,
+                "p95": 90,
+                "max": 90,
+            },
+            "attribution_counts": {"source": 0, "relay": 2, "destination": 0},
+        },
+    ]
+
+
+def test_profile_attribution_counts_follow_existing_attribution(workspace):
+    # source wins twice, relay once, destination once; absent attributions are 0.
+    events = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 100, 50, 40),   # source
+        latency_event("chain-a", 2, "A2", 2_000_000, 50, 200, 60),   # relay
+        latency_event("chain-a", 3, "A3", 3_000_000, 50, 60, 300),   # destination
+        latency_event("chain-a", 4, "A4", 4_000_000, 100, 50, 40),   # source
+    ]
+    _reports, profile = run_profile(workspace, events)
+
+    rows = read_profile(profile)
+    assert rows[0]["attribution_counts"] == {
+        "source": 2,
+        "relay": 1,
+        "destination": 1,
+    }
+
+
+def test_profile_isolation_mode_failed_rows_are_counted(workspace):
+    # three_mixed_events: verified seq1, failed seq2, verified seq3; all share
+    # the 400/500/400 latency block and a relay attribution.
+    _reports, profile = run_profile(
+        workspace, three_mixed_events(), tolerate_failures=True
+    )
+
+    rows = read_profile(profile)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "proof_latency_ms": {"min": 400, "p50": 400, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 500, "p50": 500, "p95": 500, "max": 500},
+            "destination_latency_ms": {
+                "min": 400,
+                "p50": 400,
+                "p95": 400,
+                "max": 400,
+            },
+            "attribution_counts": {"source": 0, "relay": 3, "destination": 0},
+        }
+    ]
+
+
+def test_profile_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    _reports, profile = run_profile(workspace)
+
+    assert profile.exists()
+    assert profile.read_text(encoding="utf-8") == ""
+
+
+def test_profile_omitted_writes_nothing_and_behavior_unchanged(workspace):
+    write_events(workspace["input"], three_events())
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    reports = run(workspace["input"], workspace["checkpoint"], workspace["output"])
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert not profile.exists()
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_profile_covers_whole_input_across_resume_and_append(workspace):
+    first_batch = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 400, 500, 400),
+        latency_event("chain-a", 4, "A4", 2_000_000, 400, 500, 400),
+    ]
+    write_events(workspace["input"], first_batch)
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_profile_output=profile,
+    )
+    assert read_profile(profile)[0]["event_count"] == 2
+
+    second_batch = first_batch + [
+        latency_event("chain-a", 7, "A7", 3_000_000, 400, 500, 400)
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_profile_output=profile,
+    )
+    # Only the appended event is selected, yet the profile covers all three.
+    assert [r["sequence"] for r in reports] == [7]
+    expected = [
+        {
+            "chain_id": "chain-a",
+            "event_count": 3,
+            "proof_latency_ms": {"min": 400, "p50": 400, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 500, "p50": 500, "p95": 500, "max": 500},
+            "destination_latency_ms": {
+                "min": 400,
+                "p50": 400,
+                "p95": 400,
+                "max": 400,
+            },
+            "attribution_counts": {"source": 0, "relay": 3, "destination": 0},
+        }
+    ]
+    assert read_profile(profile) == expected
+
+    # A no-op rerun (no newly selected rows) rewrites the identical profile.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_profile_output=profile,
+    )
+    assert again == []
+    assert read_profile(profile) == expected
+
+
+def test_profile_atomically_replaces_stale_file(workspace):
+    write_events(workspace["input"], [make_event()])
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    profile.write_text("STALE\n", encoding="utf-8")
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_profile_output=profile,
+    )
+
+    rows = read_profile(profile)
+    assert len(rows) == 1
+    assert rows[0]["chain_id"] == "chain-7"
+
+
+def test_profile_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_profile_output=profile,
+        )
+
+    assert not profile.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_profile_invalid_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_profile_output=profile,
+        )
+
+    assert not profile.exists()
+
+
+def test_profile_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_profile_output=profile,
+        )
+
+    assert not profile.exists()
+    assert not workspace["output"].exists()
+
+
+def test_profile_does_not_change_report_checkpoint_or_breach(workspace):
+    write_events(workspace["input"], [make_event()])
+    thresholds_path = workspace["output"].with_name("thresholds.json")
+    breach = workspace["output"].with_name("breach.jsonl")
+    write_thresholds(thresholds_path, DEFAULT_THRESHOLDS)
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        latency_thresholds=thresholds_path,
+        latency_breach_output=breach,
+        latency_profile_output=profile,
+    )
+
+    # Every artifact is published and keeps its exact established field set.
+    row = json.loads(workspace["output"].read_text().splitlines()[0])
+    assert set(row) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+        "attribution",
+        "finalized_at",
+    }
+    assert set(read_checkpoint(workspace)) == {
+        "schema_version",
+        "last_sequence_by_chain",
+        "processed_lines",
+        "input_prefix_sha256",
+    }
+    assert set(read_breaches(breach)[0]) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "breached_stages",
+        "attribution",
+        "finalized_at",
+    }
+    assert len(read_profile(profile)) == 1
+
+
+def test_profile_unwritable_path_raises_oserror_after_publish(workspace):
+    write_events(workspace["input"], [make_event()])
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    profile = blocked / PROFILE_PATH_NAME
+
+    with pytest.raises(OSError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            latency_profile_output=profile,
+        )
+
+    # The profile is published last-but-one; report and checkpoint are already
+    # safely on disk when its write fails.
+    assert not profile.exists()
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+
+
+def test_cli_profile_output_success(workspace):
+    events = [
+        latency_event("chain-a", 1, "A1", 1_000_000, 100, 500, 50),
+        latency_event("chain-a", 2, "A2", 2_000_000, 400, 800, 90),
+    ]
+    write_events(workspace["input"], events)
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-profile-output", str(profile),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = read_profile(profile)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "event_count": 2,
+            "proof_latency_ms": {"min": 100, "p50": 100, "p95": 400, "max": 400},
+            "relay_latency_ms": {"min": 500, "p50": 500, "p95": 800, "max": 800},
+            "destination_latency_ms": {
+                "min": 50,
+                "p50": 50,
+                "p95": 90,
+                "max": 90,
+            },
+            "attribution_counts": {"source": 0, "relay": 2, "destination": 0},
+        }
+    ]
+
+
+def test_cli_profile_output_omitted_is_unchanged(workspace):
+    write_events(workspace["input"], [make_event()])
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert workspace["output"].exists()
+    assert not profile.exists()
+
+
+def test_cli_profile_unwritable_path_is_oserror_json(workspace):
+    write_events(workspace["input"], [make_event()])
+    blocked = workspace["output"].with_name("no-such-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    profile = blocked / PROFILE_PATH_NAME
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-profile-output", str(profile),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+
+
+def test_cli_profile_isolation_mode_counts_failed_rows(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+        "--latency-profile-output", str(profile),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rows = read_profile(profile)
+    assert len(rows) == 1
+    assert rows[0]["event_count"] == 3
+    assert rows[0]["attribution_counts"] == {
+        "source": 0,
+        "relay": 3,
+        "destination": 0,
+    }
+
+
+def test_cli_profile_strict_failure_leaves_no_profile_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-profile-output", str(profile),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not profile.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_profile_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--latency-profile-output", str(profile),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert profile.exists()
+    assert profile.read_text(encoding="utf-8") == ""
