@@ -57,11 +57,29 @@ failed）；严格模式的证明失败仍在发布前抛 ProofVerificationError
 行；空输入写空文件。每行含 chain_id、event_count、三个延迟统计对象
 （proof_latency_ms、relay_latency_ms、destination_latency_ms，各仅含 min、
 p50、p95、max，p50/p95 取最近秩 max(1,ceil(0.50*n))、
-max(1,ceil(0.95*n))）与 attribution_counts（仅含 source、relay、
-destination，未出现写 0）。隔离模式下 proof_status=failed 的事件同样有确定
+max(1,ceil(0.95*n))）与 attribution_counts（仅含 source、relay、destination，未出现写 0）。隔离模式下 proof_status=failed 的事件同样有确定
 延迟与归因，与 verified 一起统计；严格模式证明失败仍在发布前抛
 ProofVerificationError，不写画像。任何领域错误都不写画像；省略该参数时行为
 与旧版完全一致。
+
+可选的链级 SLO 汇总（``chain_slo_thresholds`` 与 ``chain_health_output``
+成对给出）在报告、检查点、连续性盘点、延迟画像、延迟越界清单全部安全发布
+后最后原子写出：阈值文件为 UTF-8 JSON 对象，仅含
+proof_failure_rate_permille、missing_sequence_rate_permille、
+proof_latency_ms_p95、relay_latency_ms_p95、
+destination_latency_ms_p95 五个字段；前两项为 0 到 1000 的整数千分率上限，
+后三项为非负整数毫秒，字段或值不合规抛 InvalidInputError。汇总覆盖当前
+输入全部结构合法事件（与游标无关），按 chain_id 首现顺序每链一行 UTF-8
+JSONL：proof_failure_rate_permille 为隔离模式 proof_status=failed 事件数
+除以事件数乘 1000 向上取整（严格模式的证明失败仍在发布前抛
+ProofVerificationError，不写汇总，故该比率恒为 0），
+missing_sequence_rate_permille 为连续性盘点口径的 missing_count 除以
+(event_count+missing_count) 乘 1000 向上取整；latency_p95_ms 的三个整数
+键取阈值名去掉 ``_p95`` 后缀（proof_latency_ms、relay_latency_ms、
+destination_latency_ms），值取链级延迟画像的 p95 最近秩，含失败行；
+violations 按两比率、三 p95 的固定顺序仅列严格大于阈值的项，达标为 []。
+空输入写空文件；任何领域错误都不写汇总。省略这对参数时行为与旧版完全
+一致。
 """
 
 from __future__ import annotations
@@ -126,6 +144,21 @@ LATENCY_THRESHOLD_FIELDS = (
 
 # 延迟画像 attribution_counts 的固定键序（归因阶段名）。
 ATTRIBUTION_FIELDS = (_SOURCE, _RELAY, _DESTINATION)
+
+# 链级 SLO 阈值字段名与固定顺序：先两个千分率上限，再三段 p95 毫秒上限；
+# 顺序即 health 行 violations 中各违规项的固定列出顺序。
+CHAIN_SLO_RATE_FIELDS = (
+    "proof_failure_rate_permille",
+    "missing_sequence_rate_permille",
+)
+CHAIN_SLO_LATENCY_P95_FIELDS = (
+    "proof_latency_ms_p95",
+    "relay_latency_ms_p95",
+    "destination_latency_ms_p95",
+)
+CHAIN_SLO_THRESHOLD_FIELDS = (
+    CHAIN_SLO_RATE_FIELDS + CHAIN_SLO_LATENCY_P95_FIELDS
+)
 
 
 class RelayWatchError(Exception):
@@ -1016,6 +1049,72 @@ def load_latency_thresholds(path: PathLike) -> dict[str, int]:
     return thresholds
 
 
+def load_chain_slo_thresholds(path: PathLike) -> dict[str, int]:
+    """读取并校验链级 SLO 阈值 JSON 对象。
+
+    文件必须是 UTF-8 JSON 对象，且恰好只含
+    proof_failure_rate_permille、missing_sequence_rate_permille、
+    proof_latency_ms_p95、relay_latency_ms_p95、
+    destination_latency_ms_p95 五个字段：前两个为 0 到 1000（含端点）的
+    整数千分率上限，后三个为非负整数毫秒（布尔、浮点、字符串、null、越界
+    整数等一律拒绝）。无法解析或不合规都抛 InvalidInputError；文件无法
+    打开等错误原样作为 OSError 子类传播，文件存在但含非法 UTF-8 字节按
+    不合规输入抛 InvalidInputError。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except UnicodeDecodeError as exc:
+        raise InvalidInputError(
+            f"chain SLO thresholds {str(path)!r}: invalid UTF-8 byte "
+            f"sequence: {exc.reason}"
+        ) from exc
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidInputError(
+            f"chain SLO thresholds {str(path)!r}: invalid JSON: {exc.msg}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise InvalidInputError(
+            f"chain SLO thresholds {str(path)!r}: must be a JSON object"
+        )
+
+    missing = [name for name in CHAIN_SLO_THRESHOLD_FIELDS if name not in data]
+    if missing:
+        raise InvalidInputError(
+            f"chain SLO thresholds {str(path)!r}: missing field(s): "
+            f"{', '.join(missing)}"
+        )
+    unknown = set(data) - set(CHAIN_SLO_THRESHOLD_FIELDS)
+    if unknown:
+        raise InvalidInputError(
+            f"chain SLO thresholds {str(path)!r}: unknown field(s): "
+            f"{', '.join(sorted(unknown))}"
+        )
+
+    thresholds: dict[str, int] = {}
+    for name in CHAIN_SLO_RATE_FIELDS:
+        value = data[name]
+        if not _is_int(value) or not 0 <= value <= 1000:
+            raise InvalidInputError(
+                f"chain SLO thresholds {str(path)!r}: {name} must be an "
+                "integer between 0 and 1000 inclusive"
+            )
+        thresholds[name] = value
+    for name in CHAIN_SLO_LATENCY_P95_FIELDS:
+        value = data[name]
+        if not _is_int(value) or value < 0:
+            raise InvalidInputError(
+                f"chain SLO thresholds {str(path)!r}: {name} must be a "
+                "non-negative integer number of milliseconds"
+            )
+        thresholds[name] = value
+    return thresholds
+
+
 def _build_latency_breaches(
     reports: list[dict], thresholds: dict[str, int]
 ) -> list[dict]:
@@ -1108,6 +1207,114 @@ def _build_latency_profile(events: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# 链级 SLO 汇总
+# --------------------------------------------------------------------------- #
+def _ceil_permille(numerator: int, denominator: int) -> int:
+    """ceil(1000 * numerator / denominator)；分母恒为正的整数精确实现。"""
+    return (1000 * numerator + denominator - 1) // denominator
+
+
+def _build_chain_slo(
+    events: list[dict],
+    failed_identities: set[tuple[str, int]],
+    thresholds: dict[str, int],
+) -> list[dict]:
+    """按链汇总两比率与三段 p95 并对照阈值列违规，覆盖整个当前输入。
+
+    每链一行，按该链在输入中的首次出现排序。失败计数为
+    ``failed_identities``（(chain_id, sequence) 集合）命中的事件数——严格
+    模式证明失败在任何发布前抛出，故严格模式下该集合恒空、失败率恒为 0；
+    缺失计数沿用连续性盘点口径（相邻已出现 sequence 间空缺总数）。两个比率
+    为 ceil(1000 * 失败数 / 事件数) 与
+    ceil(1000 * missing_count / (event_count + missing_count))。三个 p95 取
+    链级延迟画像同一口径的最近秩，失败行同样参与。violations 按两个比率、
+    三个 p95 的固定顺序仅列「严格大于」阈值的项（键为阈值名去掉 ``_p95``
+    后缀的形式），全部达标时为 []。
+    """
+    missing_by_chain = {
+        row["chain_id"]: row["missing_count"]
+        for row in _build_continuity(events)
+    }
+
+    per_chain: dict[str, dict[str, list[int]]] = {}
+    event_counts: dict[str, int] = {}
+    failure_counts: dict[str, int] = {}
+    for event in events:
+        chain = event["chain_id"]
+        latency = _latency_fields(event)
+        if chain not in per_chain:
+            per_chain[chain] = {name: [] for name in LATENCY_THRESHOLD_FIELDS}
+            event_counts[chain] = 0
+            failure_counts[chain] = 0
+        event_counts[chain] += 1
+        for name in LATENCY_THRESHOLD_FIELDS:
+            per_chain[chain][name].append(latency[name])
+        if (chain, event["sequence"]) in failed_identities:
+            failure_counts[chain] += 1
+
+    rows: list[dict] = []
+    for chain, stages in per_chain.items():
+        event_count = event_counts[chain]
+        failure_count = failure_counts[chain]
+        missing_count = missing_by_chain[chain]
+        failure_rate = _ceil_permille(failure_count, event_count)
+        missing_denominator = event_count + missing_count
+        missing_rate = _ceil_permille(missing_count, missing_denominator)
+        latency_p95 = {
+            name: _nearest_rank(sorted(stages[name]), 0.95)
+            for name in LATENCY_THRESHOLD_FIELDS
+        }
+
+        # (输出键, 实际值, 阈值键)；先两比率再三 p95，顺序即 violations
+        # 中各违规项的固定列出顺序。
+        metrics = (
+            (
+                "proof_failure_rate_permille",
+                failure_rate,
+                "proof_failure_rate_permille",
+            ),
+            (
+                "missing_sequence_rate_permille",
+                missing_rate,
+                "missing_sequence_rate_permille",
+            ),
+            (
+                "proof_latency_ms",
+                latency_p95["proof_latency_ms"],
+                "proof_latency_ms_p95",
+            ),
+            (
+                "relay_latency_ms",
+                latency_p95["relay_latency_ms"],
+                "relay_latency_ms_p95",
+            ),
+            (
+                "destination_latency_ms",
+                latency_p95["destination_latency_ms"],
+                "destination_latency_ms_p95",
+            ),
+        )
+        violations = [
+            name
+            for name, value, threshold_name in metrics
+            if value > thresholds[threshold_name]
+        ]
+        rows.append(
+            {
+                "chain_id": chain,
+                "event_count": event_count,
+                "proof_failure_rate_permille": failure_rate,
+                "missing_sequence_rate_permille": missing_rate,
+                # latency_p95 仅含 proof/relay/destination_latency_ms 三个
+                # 整数键（阈值名去 _p95 后缀），顺序与画像对象一致。
+                "latency_p95_ms": latency_p95,
+                "violations": violations,
+            }
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -1131,6 +1338,8 @@ def watch(
     latency_thresholds: Optional[PathLike] = None,
     latency_breach_output: Optional[PathLike] = None,
     latency_profile_output: Optional[PathLike] = None,
+    chain_slo_thresholds: Optional[PathLike] = None,
+    chain_health_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -1182,10 +1391,32 @@ def watch(
     下 proof_status="failed" 的事件同样有确定延迟与归因，与 verified 一起
     统计。严格模式证明失败仍在任何发布前抛 ProofVerificationError，不写
     画像；任何领域错误都不写画像。省略该参数时行为与旧版完全一致。
+
+    同时（且必须成对）给出 ``chain_slo_thresholds`` 与
+    ``chain_health_output`` 时，在报告、检查点、连续性盘点、延迟画像、延迟
+    越界清单全部安全发布后，最后再原子写出一份链级 SLO 汇总（UTF-8 JSONL，
+    按 chain_id 首现顺序每链一行；详见 :func:`_build_chain_slo`）。阈值
+    文件仅含 proof_failure_rate_permille、missing_sequence_rate_permille
+    （0 到 1000 的整数）与 proof_latency_ms_p95、relay_latency_ms_p95、
+    destination_latency_ms_p95（非负整数毫秒），字段或值不合规抛
+    InvalidInputError；两参数缺一对（API）同样抛 InvalidInputError。汇总
+    覆盖当前输入全部结构合法事件（与游标无关）：隔离模式下逐条重验全部事件
+    的证明以统计链级失败数（续传重跑结果一致），严格模式首个证明失败仍在
+    任何发布前抛 ProofVerificationError，不写汇总；两比率为失败数/事件数
+    与 missing_count/(event_count+missing_count) 乘 1000 向上取整，三个
+    p95 取链级延迟画像的 p95 最近秩（失败行同口径参与），violations 按两
+    比率、三 p95 的顺序仅列严格大于阈值的项，达标为 []。空输入写空文件；
+    领域错误时不写汇总，阈值文件本身的读取错误原样作为 OSError 子类传播。
+    省略这对参数时行为与旧版完全一致。
     """
     if (latency_thresholds is None) != (latency_breach_output is None):
         raise InvalidInputError(
             "latency_thresholds and latency_breach_output must be given "
+            "together"
+        )
+    if (chain_slo_thresholds is None) != (chain_health_output is None):
+        raise InvalidInputError(
+            "chain_slo_thresholds and chain_health_output must be given "
             "together"
         )
 
@@ -1195,6 +1426,12 @@ def watch(
     thresholds: Optional[dict[str, int]] = None
     if latency_thresholds is not None:
         thresholds = load_latency_thresholds(latency_thresholds)
+
+    # SLO 阈值同属额外输入，同样在任何发布之前加载校验；文件本身打不开等
+    # 错误原样作为 OSError 子类传播。
+    slo_thresholds: Optional[dict[str, int]] = None
+    if chain_slo_thresholds is not None:
+        slo_thresholds = load_chain_slo_thresholds(chain_slo_thresholds)
 
     events, data, lines = _load_input(input_path)
 
@@ -1225,6 +1462,24 @@ def watch(
             reports.append(build_failed_report(event, exc))
         else:
             reports.append(build_report(event))
+
+    # 链级 SLO 汇总覆盖整个当前输入（含游标前的历史事件），失败率需要全部
+    # 事件的证明结果而非仅本次新行：隔离模式下逐条重验，收集
+    # (chain_id, sequence) 失败身份（纯函数重放，续传与重复执行结果一致）；
+    # 严格模式下任一事件（含游标覆盖的历史事件）证明失败都在任何发布前抛
+    # ProofVerificationError，不写汇总。仅在启用该对参数时执行，省略时行为
+    # 完全不变。
+    failed_identities: set[tuple[str, int]] = set()
+    if chain_health_output is not None:
+        for event in events:
+            try:
+                verify_proof(event)
+            except ProofVerificationError:
+                if not tolerate_failures:
+                    raise
+                failed_identities.add(
+                    (event["chain_id"], event["sequence"])
+                )
 
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
     # 事件；续传时累积发布按 (chain_id, sequence) 去重，因此即便重选也不会
@@ -1286,6 +1541,19 @@ def watch(
             _render_reports(_build_latency_breaches(reports, thresholds)),
         )
 
+    # 链级 SLO 汇总在所有其他产物之后最后发布：由全部结构合法事件推导
+    # （含游标前历史行；失败身份见上），与游标无关，故空批（无新事件）也
+    # 照常写出同一内容，空输入写空文件。走到这里时整批已定稿，严格模式的
+    # 证明失败已在发布前抛出，不可能到达此处。
+    if chain_health_output is not None:
+        assert slo_thresholds is not None
+        _atomic_write(
+            chain_health_output,
+            _render_reports(
+                _build_chain_slo(events, failed_identities, slo_thresholds)
+            ),
+        )
+
     return reports
 
 
@@ -1298,6 +1566,8 @@ def run(
     latency_thresholds: Optional[PathLike] = None,
     latency_breach_output: Optional[PathLike] = None,
     latency_profile_output: Optional[PathLike] = None,
+    chain_slo_thresholds: Optional[PathLike] = None,
+    chain_health_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
@@ -1307,7 +1577,10 @@ def run(
     写出延迟越界清单（阈值文件与越界判定口径见 :func:`watch`）；
     ``latency_profile_output`` 给定时在连续性盘点之后、延迟越界清单之前
     原子写出链级延迟画像（每链一行的 min/p50/p95/max 与归因计数，口径见
-    :func:`watch` 与 :func:`_build_latency_profile`）。
+    :func:`watch` 与 :func:`_build_latency_profile`）；
+    ``chain_slo_thresholds`` 与 ``chain_health_output`` 成对给定时最后原子
+    写出链级 SLO 汇总（每链一行的两比率、三段 p95 与 violations，阈值文件
+    与判定口径见 :func:`watch` 与 :func:`_build_chain_slo`）。
     """
     return watch(
         input,
@@ -1318,4 +1591,6 @@ def run(
         latency_thresholds,
         latency_breach_output,
         latency_profile_output,
+        chain_slo_thresholds,
+        chain_health_output,
     )

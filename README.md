@@ -11,7 +11,49 @@
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
 输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
-可选的延迟越界清单；可选的链级延迟画像。
+可选的延迟越界清单；可选的链级延迟画像；可选的链级 SLO 汇总。
+
+## 链级 SLO 汇总
+
+成对传入 `--chain-slo-thresholds PATH --chain-health-output PATH`（模块
+API 为 `run(..., chain_slo_thresholds=PATH, chain_health_output=PATH)`）
+后，在报告、检查点、连续性盘点（若有）、延迟画像（若有）、延迟越界清单
+（若有）全部安全发布之后，最后原子写出一份 UTF-8 JSONL 汇总；两个参数
+缺一不可（CLI 以 `InvalidArgument` 固定 JSON、退出码 2 报错；API 抛
+`InvalidInputError`）。汇总按 `chain_id` 在输入中的首次出现顺序，每链
+一行；覆盖**当前输入全部结构合法事件**而非游标后的新行，因此续传、追加
+与重复执行结果一致，空输入写空文件。
+
+- 阈值文件为 UTF-8 JSON 对象，**仅含** `proof_failure_rate_permille`、
+  `missing_sequence_rate_permille`、`proof_latency_ms_p95`、
+  `relay_latency_ms_p95`、`destination_latency_ms_p95` 五个字段；前两个
+  为 **0 到 1000（含端点）的整数**千分率上限，后三个为**非负整数毫秒**。
+  不是 JSON 对象、缺字段、出现未知字段、值为布尔/浮点/字符串/null/越界
+  整数等都抛 `InvalidInputError`。
+- 每行字段为 `chain_id`、`event_count`、`proof_failure_rate_permille`、
+  `missing_sequence_rate_permille`、`latency_p95_ms`、`violations`。
+- `proof_failure_rate_permille` 为隔离模式（`--tolerate-failures`）下
+  该链 `proof_status=failed` 事件数除以事件数乘 1000 **向上取整**；
+  `missing_sequence_rate_permille` 为连续性盘点口径的 `missing_count`
+  除以 `(event_count + missing_count)` 乘 1000 **向上取整**（分母恒为
+  正）。
+- `latency_p95_ms` **仅含** `proof_latency_ms`、`relay_latency_ms`、
+  `destination_latency_ms` 三个整数键（阈值名去掉 `_p95` 后缀），值取
+  链级延迟画像同一口径的 p95 最近秩 `max(1,ceil(0.95*n))`。
+- `violations` 按两比率、三 p95 的固定顺序
+  （`proof_failure_rate_permille`、`missing_sequence_rate_permille`、
+  `proof_latency_ms`、`relay_latency_ms`、`destination_latency_ms`）
+  **仅列严格大于阈值的项**（等于不违规）；全部达标时为 `[]`。
+- 隔离模式下 `proof_status=failed` 的事件计入失败率，且与 verified 行
+  一起计入三个 p95；严格模式证明失败仍在任何发布前抛
+  `ProofVerificationError`，汇总（及其他产物）都不写——此时不存在失败
+  率输出。
+- 汇总不参与游标，也不改报告、检查点、盘点、画像与越界清单字段；同链
+  `sequence` 重复、时间字段非法、输入或检查点不合规仍抛
+  `InvalidInputError` 或 `CheckpointError`，领域错误不生成汇总。省略这
+  对参数时不生成额外文件，旧产物、异常与退出码完全不变。阈值文件打不
+  开、汇总路径不可写等文件错误沿用 CLI 的 OSError 子类 JSON 错误与非零
+  退出。
 
 ## 链级延迟画像
 
