@@ -12,7 +12,45 @@
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
 输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
 可选的延迟越界清单；可选的链级延迟画像；可选的链级 SLO 汇总；可选的链级
-时间窗口趋势画像。
+时间窗口趋势画像；可选的轻客户端证明校验审计画像。
+
+## 轻客户端证明校验审计画像
+
+传入 `--proof-audit-output PATH`（模块 API 为
+`run(..., proof_audit_output=PATH)`）后，在报告、检查点、连续性盘点、
+链级延迟画像、延迟越界清单（若有）、链级 SLO 汇总（若有）与链级时间窗口
+趋势画像（若有）都安全发布之后，**最后**原子替换一份 UTF-8 JSONL 审计
+画像。画像按**输入行序**为当前完整输入的**全部结构合法事件**各写一行，
+而非游标后的新行，因此续传、追加与重复执行结果一致，空输入原子写空文件。
+
+- 每行字段为 `event_id`、`chain_id`、`sequence`、`proof_status`、
+  `light_client_version`、`provided_signature_count`、
+  `unique_signature_count`、`quorum`、`checks`、`failed_checks`、
+  `finalized_at`。
+- `proof_status` 仅取 `verified` 或 `failed`：三项检查全部为 true 才是
+  `verified`。
+- `provided_signature_count` 为原始 `proof.signatures` 列表长度（不做
+  任何处理）；`unique_signature_count` 为 quorum 判定所用的原始签名
+  字符串去重集合大小（重复签名只计一次）。
+- `checks` 恰好含三个布尔键，依次为 `quorum_sufficient`、
+  `validator_set_hash_matches`、`trusted_root_matches_header`，各自
+  复用现有证明规则独立判定（一项失败不短路其余项）：去重签名达到 quorum；
+  声明的验证者集合哈希等于按版本、链与签名者重算的承诺；可信根属于该
+  版本下认证区块头哈希的候选承诺之一。
+- `failed_checks` 仅按上述固定顺序列出值为 false 的键；`verified` 行为
+  `[]`。
+- 审计画像是只读推导：不参与游标与汇总，不改报告、检查点、输入前缀
+  摘要或任何既有输出。
+- 隔离模式（`--tolerate-failures true`）下成功与失败事件都入画像：
+  报告失败行仍含 `error_type`/`error_message`，审计行 `proof_status`
+  为 `failed`；严格模式证明失败（含游标覆盖的历史失败事件，例如先前以
+  隔离模式处理、本次改为严格模式续传）仍在任何发布之前抛
+  `ProofVerificationError`，不写画像。
+- 结构错误、同链重复 `sequence`、时间顺序错误与检查点不合规仍抛
+  `InvalidInputError` 或 `CheckpointError`，CLI 错误 JSON 与退出码
+  不变且不写画像。画像路径不可写等文件错误沿用 CLI 的 OSError 子类
+  固定 JSON 错误与非零退出（此前已发布的产物不受影响）。
+- 省略该参数时 CLI、`run`、报告、检查点、异常与退出码与旧版完全一致。
 
 ## 链级时间窗口趋势画像
 

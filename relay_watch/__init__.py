@@ -93,13 +93,35 @@ event_count，失败另计 proof_failure_count，三段延迟与归因同口径�
 退出码且不写趋势文件，趋势文件最后原子替换，路径不可写沿用 OSError
 JSON 错误与非零退出；省略这对参数时既有结果不变。
 
+可选的轻客户端证明校验审计画像（``proof_audit_output`` /
+``--proof-audit-output``）在报告、检查点、连续性盘点、链级延迟画像、
+延迟越界清单、链级 SLO 汇总与链级时间窗口趋势画像（若有）均安全发布后
+**最后**原子替换：UTF-8 JSONL，按输入行序为当前完整输入的全部结构合法
+事件各写一行（而非游标后的新行），续传、追加、重复执行结果一致，空输入
+写空文件。行字段为 event_id、chain_id、sequence、proof_status、
+light_client_version、provided_signature_count（原始 signatures 列表
+长度）、unique_signature_count（quorum 判定所用的原始签名字符串去重
+集合大小）、quorum、checks（三个布尔键依次为 quorum_sufficient、
+validator_set_hash_matches、trusted_root_matches_header，各自复用
+verify_proof 的同一条现有规则独立判定）、failed_checks（仅按上述顺序
+列出 false 项，verified 为 []）与 finalized_at。审计画像是只读推导，
+不参与游标或汇总，不改报告、检查点、输入前缀摘要与任何既有输出；隔离
+模式成功与失败事件都入画像（报告失败行仍含 error_type/error_message，
+审计行 proof_status=failed），严格模式证明失败（含游标覆盖的历史失败
+事件）仍在任何发布前抛 ProofVerificationError 且不写画像；结构错误、
+同链重复 sequence、时间顺序错误、检查点不合规同样不写画像，CLI 错误
+JSON 与退出码不变。省略该参数时既有结果完全不变；画像路径不可写等
+文件错误沿用 CLI 的 OSError 子类固定 JSON 错误与非零退出（此前已发布
+的产物不受影响）。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
   tolerate_failures=False, continuity_output=None,
   latency_thresholds=None, latency_breach_output=None,
   latency_profile_output=None, chain_slo_thresholds=None,
-  chain_health_output=None, trend_window_ms=None, trend_output=None)``
+  chain_health_output=None, trend_window_ms=None, trend_output=None,
+  proof_audit_output=None)``
   -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
@@ -107,7 +129,8 @@ JSON 错误与非零退出；省略这对参数时既有结果不变。
   [--latency-thresholds PATH --latency-breach-output PATH]
   [--latency-profile-output PATH]
   [--chain-slo-thresholds PATH --chain-health-output PATH]
-  [--trend-window-ms N --trend-output PATH]``；
+  [--trend-window-ms N --trend-output PATH]
+  [--proof-audit-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

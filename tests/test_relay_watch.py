@@ -5519,3 +5519,643 @@ def test_cli_trend_unwritable_path_is_oserror_json(workspace):
     assert workspace["output"].exists()
     assert read_checkpoint(workspace)["schema_version"] == 3
     assert not trend.exists()
+
+# ---------------------------------------------------------------------------
+# Light-client proof verification audit profile (proof_audit_output)
+# ---------------------------------------------------------------------------
+
+
+AUDIT_PATH_NAME = "proof-audit.jsonl"
+
+
+def read_audit(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def audit_event(chain_id, sequence, event_id, base, **proof_overrides):
+    """A structure-valid event on chain_id with a globally-unique time block.
+
+    Proof bits (e.g. quorum, signatures, hashes) pass through to make_event;
+    a bad proof yields a structurally valid but failing event.
+    """
+    return chain_event(chain_id, sequence, event_id, base, **proof_overrides)
+
+
+def run_audit(workspace, events=None, **kwargs):
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    if events is not None:
+        write_events(workspace["input"], events)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        proof_audit_output=audit,
+        **kwargs,
+    )
+    return reports, audit
+
+
+def test_audit_verified_row_fields_and_checks(workspace):
+    write_events(workspace["input"], [audit_event("chain-7", 1, "E1", 1000)])
+    _reports, audit = run_audit(workspace)
+
+    rows = read_audit(audit)
+    assert rows == [
+        {
+            "event_id": "E1",
+            "chain_id": "chain-7",
+            "sequence": 1,
+            "proof_status": "verified",
+            "light_client_version": "v1",
+            "provided_signature_count": 3,
+            "unique_signature_count": 3,
+            "quorum": 2,
+            "checks": {
+                "quorum_sufficient": True,
+                "validator_set_hash_matches": True,
+                "trusted_root_matches_header": True,
+            },
+            "failed_checks": [],
+            "finalized_at": 1900,
+        }
+    ]
+    assert set(rows[0]) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "light_client_version",
+        "provided_signature_count",
+        "unique_signature_count",
+        "quorum",
+        "checks",
+        "failed_checks",
+        "finalized_at",
+    }
+    assert list(rows[0]["checks"]) == [
+        "quorum_sufficient",
+        "validator_set_hash_matches",
+        "trusted_root_matches_header",
+    ]
+    assert list(rows[0]["failed_checks"]) == []
+
+
+def test_audit_signature_counts_raw_length_and_distinct(workspace):
+    # Duplicated raw signatures inflate the raw length but not the distinct
+    # count (which is exactly the set verify_proof uses for the quorum rule).
+    good_dup = on_chain(
+        "chain-7",
+        event_id="D1",
+        sequence=1,
+        signatures=["0xaa11", "0xbb22", "0xbb22", "0xcc33"],
+        quorum=3,
+        validator_set_hash=_validator_set_hash(
+            "v1",
+            "chain-7",
+            ["0xaa11", "0xbb22", "0xbb22", "0xcc33"],
+        ),
+    )
+    write_events(workspace["input"], [good_dup])
+    _reports, audit = run_audit(workspace)
+
+    row = read_audit(audit)[0]
+    assert row["provided_signature_count"] == 4
+    assert row["unique_signature_count"] == 3
+    assert row["quorum"] == 3
+    assert row["proof_status"] == "verified"
+
+    # Same raw/distinct convention for a failing event:
+    fail_dup = on_chain(
+        "chain-7",
+        event_id="D2",
+        sequence=2,
+        observed_at=2001,
+        proof_submitted_at=2100,
+        proof_verified_at=2500,
+        finalized_at=3400,
+        signatures=["0xaa11", "00aa11", "00aa11"],
+        quorum=3,
+    )
+    # Raw strings "0xaa11" vs "00aa11" differ as strings -> distinct as per
+    # verify_proof's raw-string set, even though they normalize alike.
+    write_events(workspace["input"], [good_dup, fail_dup])
+    _reports, audit = run_audit(workspace, tolerate_failures=True)
+    rows = read_audit(audit)
+    assert rows[1]["provided_signature_count"] == 3
+    assert rows[1]["unique_signature_count"] == 2
+    assert rows[1]["checks"]["quorum_sufficient"] is False
+    assert rows[1]["proof_status"] == "failed"
+
+
+def test_audit_failed_row_lists_only_false_checks_in_order(workspace):
+    # Quorum failure only: hash/root checks still independently true.
+    below_quorum = audit_event(
+        "chain-a", 1, "A1", 1000, signatures=["0xaa11"], quorum=2
+    )
+    # Hash mismatch only: quorum sufficient (3 sigs, quorum 2), root fine.
+    hash_bad = audit_event(
+        "chain-a", 2, "A2", 2000, validator_set_hash="0x" + "11" * 32
+    )
+    # Root mismatch only: quorum and hash fine, bad trusted_root.
+    root_bad = audit_event(
+        "chain-a",
+        3,
+        "A3",
+        3000,
+        trusted_root="0x" + "22" * 32,
+        header_hash="0xdeadbeef",
+    )
+    # Version mismatch: on_chain recomputed the validator-set hash for the
+    # overridden version v9, so only the v1-pinned trusted root fails.
+    version_bad = audit_event(
+        "chain-a", 4, "A4", 4000, light_client_version="v9"
+    )
+    # All three checks fail: below quorum, wrong hash, wrong root.
+    all_bad = audit_event(
+        "chain-a",
+        5,
+        "A5",
+        5000,
+        signatures=["0xaa11"],
+        quorum=2,
+        validator_set_hash="0x" + "11" * 32,
+        trusted_root="0x" + "22" * 32,
+        header_hash="0xdeadbeef",
+    )
+    events = [below_quorum, hash_bad, root_bad, version_bad, all_bad]
+    write_events(workspace["input"], events)
+    _reports, audit = run_audit(workspace, tolerate_failures=True)
+
+    rows = read_audit(audit)
+    assert [r["event_id"] for r in rows] == ["A1", "A2", "A3", "A4", "A5"]
+    assert all(r["proof_status"] == "failed" for r in rows)
+    assert rows[0]["failed_checks"] == ["quorum_sufficient"]
+    assert rows[0]["checks"]["validator_set_hash_matches"] is True
+    assert rows[0]["checks"]["trusted_root_matches_header"] is True
+    assert rows[1]["failed_checks"] == ["validator_set_hash_matches"]
+    assert rows[1]["checks"]["quorum_sufficient"] is True
+    assert rows[1]["checks"]["trusted_root_matches_header"] is True
+    assert rows[2]["failed_checks"] == ["trusted_root_matches_header"]
+    assert rows[2]["checks"]["quorum_sufficient"] is True
+    assert rows[2]["checks"]["validator_set_hash_matches"] is True
+    assert rows[3]["failed_checks"] == [
+        "trusted_root_matches_header",
+    ]
+    assert rows[3]["checks"]["quorum_sufficient"] is True
+    assert rows[3]["checks"]["validator_set_hash_matches"] is True
+    assert rows[4]["failed_checks"] == [
+        "quorum_sufficient",
+        "validator_set_hash_matches",
+        "trusted_root_matches_header",
+    ]
+
+
+def test_audit_multiple_chains_preserve_input_order(workspace):
+    events = interlocked_events()
+    write_events(workspace["input"], events)
+    _reports, audit = run_audit(workspace)
+
+    rows = read_audit(audit)
+    assert [
+        (r["chain_id"], r["sequence"], r["proof_status"]) for r in rows
+    ] == [
+        ("chain-a", 1, "verified"),
+        ("chain-b", 1, "verified"),
+        ("chain-a", 2, "verified"),
+        ("chain-b", 2, "verified"),
+        ("chain-a", 3, "verified"),
+        ("chain-b", 3, "verified"),
+    ]
+    assert [r["event_id"] for r in rows] == [
+        "A1",
+        "B1",
+        "A2",
+        "B2",
+        "A3",
+        "B3",
+    ]
+    assert all(r["failed_checks"] == [] for r in rows)
+
+
+def test_audit_isolation_mode_includes_verified_and_failed(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    reports, audit = run_audit(workspace, tolerate_failures=True)
+
+    assert [r["proof_status"] for r in reports] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    rows = read_audit(audit)
+    assert [r["proof_status"] for r in rows] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    assert rows[1]["failed_checks"] == ["quorum_sufficient"]
+    # The audit row carries no report-specific error fields.
+    assert "error_type" not in rows[1]
+    assert "error_message" not in rows[1]
+
+
+def test_audit_empty_input_atomically_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    audit.write_text("STALE\n", encoding="utf-8")
+    _reports, audit = run_audit(workspace)
+    assert audit.exists()
+    assert audit.read_text(encoding="utf-8") == ""
+
+
+def test_audit_omitted_writes_nothing(workspace):
+    write_events(workspace["input"], [make_event()])
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert not audit.exists()
+    assert workspace["output"].exists()
+
+
+def test_audit_covers_whole_input_across_resume_append_and_rerun(workspace):
+    first_batch = [
+        audit_event("chain-a", 1, "A1", 1000),
+        audit_event("chain-a", 4, "A4", 2000),
+    ]
+    write_events(workspace["input"], first_batch)
+    _reports, audit = run_audit(workspace)
+    assert [r["sequence"] for r in read_audit(audit)] == [1, 4]
+
+    second_batch = first_batch + [audit_event("chain-a", 7, "A7", 3000)]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        proof_audit_output=audit,
+    )
+    # Only the appended event is selected for the report; the audit covers
+    # all three.
+    assert [r["sequence"] for r in reports] == [7]
+    expected = read_audit(audit)
+    assert [r["sequence"] for r in expected] == [1, 4, 7]
+    assert all(r["proof_status"] == "verified" for r in expected)
+
+    # A no-op rerun rewrites the identical audit.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        proof_audit_output=audit,
+    )
+    assert again == []
+    assert read_audit(audit) == expected
+
+
+def test_audit_atomically_replaces_stale_file(workspace):
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    audit.write_text("STALE\n", encoding="utf-8")
+    _reports, audit = run_audit(
+        workspace, [audit_event("chain-7", 1, "E1", 1000)]
+    )
+    rows = read_audit(audit)
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == "E1"
+    assert "STALE" not in audit.read_text(encoding="utf-8")
+
+
+def test_audit_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_audit_strict_rerun_over_isolated_history_raises_before_publish(
+    workspace,
+):
+    # First run in isolation mode commits a failed row and writes the audit.
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        proof_audit_output=audit,
+    )
+    output_before = workspace["output"].read_text()
+    audit_before = audit.read_text()
+
+    # A later STRICT run must surface the historically failed proof before
+    # publishing anything; the audit and report stay byte-for-byte intact.
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=False,
+            proof_audit_output=audit,
+        )
+    assert audit.read_text() == audit_before
+    assert workspace["output"].read_text() == output_before
+
+
+def test_audit_malformed_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_audit_duplicate_sequence_writes_nothing(workspace):
+    events = [
+        audit_event("chain-a", 1, "A1", 1000),
+        audit_event("chain-a", 1, "A2", 2000),
+    ]
+    write_events(workspace["input"], events)
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_audit_time_order_error_writes_nothing(workspace):
+    bad = make_event(
+        observed_at=1000,
+        proof_submitted_at=2600,
+        proof_verified_at=1500,
+        finalized_at=2400,
+    )
+    write_events(workspace["input"], [bad])
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+    assert not audit.exists()
+
+
+def test_audit_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_audit_unwritable_path_raises_oserror_after_publish(workspace):
+    write_events(
+        workspace["input"],
+        [audit_event("chain-7", 1, "E1", 1000)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    audit = blocked / AUDIT_PATH_NAME
+
+    with pytest.raises(OSError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            proof_audit_output=audit,
+        )
+
+    # The audit is published last: report and checkpoint are already safe.
+    assert not audit.exists()
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+
+
+def test_audit_does_not_change_any_other_output(workspace):
+    write_events(workspace["input"], [make_event()])
+    thresholds_path = workspace["output"].with_name("thresholds.json")
+    breach = workspace["output"].with_name("breach.jsonl")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    write_thresholds(thresholds_path, DEFAULT_THRESHOLDS)
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+        latency_thresholds=thresholds_path,
+        latency_breach_output=breach,
+        latency_profile_output=profile,
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+        trend_window_ms=10_000,
+        trend_output=trend,
+        proof_audit_output=audit,
+    )
+
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert continuity.exists()
+    assert len(read_breaches(breach)) == 1
+    assert len(read_profile(profile)) == 1
+    assert len(read_health(health)) == 1
+    assert len(read_trend(trend)) == 1
+    audit_rows = read_audit(audit)
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["proof_status"] == "verified"
+    assert audit_rows[0]["finalized_at"] == 2400
+
+
+# ---------------------------------------------------------------------------
+# Proof audit CLI
+# ---------------------------------------------------------------------------
+
+
+def test_cli_audit_output_success(workspace):
+    write_events(
+        workspace["input"],
+        [audit_event("chain-a", 1, "A1", 1000), audit_event("chain-a", 2, "A2", 2000)],
+    )
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = read_audit(audit)
+    assert [r["sequence"] for r in rows] == [1, 2]
+    assert all(r["proof_status"] == "verified" for r in rows)
+
+
+def test_cli_audit_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert audit.exists()
+    assert audit.read_text(encoding="utf-8") == ""
+
+
+def test_cli_audit_isolation_mode_includes_failed_rows(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rows = read_audit(audit)
+    assert [r["proof_status"] for r in rows] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    failed = rows[1]
+    assert failed["failed_checks"] == ["quorum_sufficient"]
+    assert "error_type" not in failed
+    assert "error_message" not in failed
+
+
+def test_cli_audit_strict_failure_leaves_no_audit_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_audit_invalid_input_is_invalid_input_error(workspace):
+    workspace["input"].write_text("nope\n", encoding="utf-8")
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "InvalidInputError"
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_audit_checkpoint_error_is_checkpoint_error(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": -5}), encoding="utf-8"
+    )
+    audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "CheckpointError"
+    assert not audit.exists()
+
+
+def test_cli_audit_unwritable_path_is_oserror_json(workspace):
+    write_events(
+        workspace["input"],
+        [audit_event("chain-7", 1, "E1", 1000)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    audit = blocked / AUDIT_PATH_NAME
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--proof-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+    # The audit is published last: every earlier artifact already exists.
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert not audit.exists()
+
+
+def test_cli_audit_omitted_keeps_behavior(workspace):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert not workspace["output"].with_name(AUDIT_PATH_NAME).exists()

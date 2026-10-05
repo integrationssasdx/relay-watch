@@ -91,6 +91,25 @@ proof_latency_ms、relay_latency_ms、destination_latency_ms，取窗口事件�
 最近秩 max(1,ceil(0.95*n))）。两参数缺一对或宽度不是 >=1 的整数都抛
 InvalidInputError；严格模式证明失败仍在发布前抛 ProofVerificationError，
 不写趋势文件。省略这对参数时行为与旧版完全一致。
+
+可选的轻客户端证明校验审计画像（``proof_audit_output``）在报告、检查点、
+连续性盘点、链级延迟画像、延迟越界清单、链级 SLO 汇总与链级时间窗口
+趋势画像均安全发布后**最后**原子替换：UTF-8 JSONL，按输入行序为全部结构
+合法事件各写一行，覆盖当前完整输入而非游标后的新行，续传、追加、重复执行
+与空输入（空文件）结果一致。行字段为 event_id、chain_id、sequence、
+proof_status、light_client_version、provided_signature_count（原始签名
+列表长度，不做任何处理）、unique_signature_count（verify_proof 的 quorum
+判定所用的原始签名字符串去重集合大小）、quorum、checks（三个布尔键依次为
+quorum_sufficient、validator_set_hash_matches、
+trusted_root_matches_header，各自复用 verify_proof 的同一条现有规则独立
+判定）、failed_checks（仅按上述顺序列出值为 false 的键，verified 行为
+``[]``）与 finalized_at。审计画像是只读推导：不改报告、游标、输入前缀
+摘要或任何既有输出。隔离模式下成功与失败事件都入画像；严格模式证明失败仍
+在任何发布之前抛 ProofVerificationError 且不写画像（含游标覆盖的历史
+事件）；结构错误、同链重复 sequence、时间顺序错误、检查点不合规同样在
+任何发布之前抛出，CLI 错误 JSON 与退出码不变且不写画像。省略该参数时
+行为与旧版完全一致；审计路径不可写等文件错误原样作为 OSError 子类传播
+（CLI 为固定 JSON 与非零退出），此前已发布的产物不受影响。
 """
 
 from __future__ import annotations
@@ -174,6 +193,15 @@ CHAIN_SLO_LATENCY_FIELDS = (
 
 # 链级 SLO 阈值文件允许的全部字段（恰好这五个，顺序固定）。
 CHAIN_SLO_THRESHOLD_FIELDS = CHAIN_SLO_RATE_FIELDS + CHAIN_SLO_LATENCY_FIELDS
+
+# 轻客户端证明审计画像 checks 的三个布尔键，顺序即各检查的判定顺序，也是
+# failed_checks 中 false 项的固定列出顺序；三者各自复用 verify_proof 中
+# 同一条现有规则。
+PROOF_AUDIT_CHECK_FIELDS = (
+    "quorum_sufficient",
+    "validator_set_hash_matches",
+    "trusted_root_matches_header",
+)
 
 
 class RelayWatchError(Exception):
@@ -1405,6 +1433,85 @@ def _build_trend(
 
 
 # --------------------------------------------------------------------------- #
+# 轻客户端证明校验审计画像
+# --------------------------------------------------------------------------- #
+def _proof_audit_checks(event: dict) -> dict[str, bool]:
+    """独立给出三项布尔检查，不抛异常；各项复用 verify_proof 的同一条规则。
+
+    结构校验已保证 proof 各字段存在且类型/十六进制合规，故此处只需重算
+    承诺并比较：
+
+    * quorum_sufficient：去重后的原始签名字符串集合达到 quorum，与
+      verify_proof 的 distinct_signatures 完全同一集合；
+    * validator_set_hash_matches：声明的验证者集合哈希等于按版本、链与
+      签名者重算的承诺（签名者按归一十六进制去重排序）；
+    * trusted_root_matches_header：可信根属于该版本下认证区块头哈希的
+      两个候选承诺之一。
+    """
+    proof = event["proof"]
+    version = proof["light_client_version"]
+    signatures: list[str] = proof["signatures"]
+    quorum = proof["quorum"]
+
+    quorum_sufficient = len(set(signatures)) >= quorum
+    validator_set_hash_matches = _normalize_hash(
+        proof["validator_set_hash"]
+    ) == _validator_set_hash(version, event["chain_id"], signatures)
+    trusted_root_matches_header = _normalize_hash(
+        proof["trusted_root"]
+    ) in _trusted_roots(version, proof["header_hash"])
+
+    return {
+        "quorum_sufficient": quorum_sufficient,
+        "validator_set_hash_matches": validator_set_hash_matches,
+        "trusted_root_matches_header": trusted_root_matches_header,
+    }
+
+
+def _build_proof_audit(
+    events: list[dict], tolerate_failures: bool
+) -> list[dict]:
+    """按输入行序为每个结构合法事件生成一行审计画像，覆盖整个当前输入。
+
+    三项检查独立判定并全部保留，失败事件的 checks 可同时含多个 false；
+    failed_checks 仅按 PROOF_AUDIT_CHECK_FIELDS 的固定顺序列出 false 项，
+    全通过时为 []。provided_signature_count 为原始 signatures 列表长度，
+    unique_signature_count 为去重集合大小（即 quorum 判定所用集合）。
+
+    隔离模式（tolerate_failures=True）下成功与失败事件都入画像；严格模式
+    遇到证明失败直接抛 ProofVerificationError，与处理循环及其他「覆盖全
+    输入」的附加产物同口径——游标覆盖的历史失败事件也在此暴露。
+    """
+    rows: list[dict] = []
+    for event in events:
+        checks = _proof_audit_checks(event)
+        # 与 verify_proof 的通过条件完全一致：三项全为 true 才 verified。
+        verified = all(checks.values())
+        if not verified and not tolerate_failures:
+            verify_proof(event)  # 抛出具体的 ProofVerificationError
+        failed_checks = [
+            name for name in PROOF_AUDIT_CHECK_FIELDS if not checks[name]
+        ]
+        proof = event["proof"]
+        rows.append(
+            {
+                "event_id": event["event_id"],
+                "chain_id": event["chain_id"],
+                "sequence": event["sequence"],
+                "proof_status": "verified" if verified else "failed",
+                "light_client_version": proof["light_client_version"],
+                "provided_signature_count": len(proof["signatures"]),
+                "unique_signature_count": len(set(proof["signatures"])),
+                "quorum": proof["quorum"],
+                "checks": checks,
+                "failed_checks": failed_checks,
+                "finalized_at": event["finalized_at"],
+            }
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -1432,6 +1539,7 @@ def watch(
     chain_health_output: Optional[PathLike] = None,
     trend_window_ms: Optional[int] = None,
     trend_output: Optional[PathLike] = None,
+    proof_audit_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -1508,6 +1616,26 @@ def watch(
     败（例如先前以隔离模式处理、本次改为严格模式续传），在此即抛
     ProofVerificationError，绝不先写报告/检查点/其他清单再失败；任何领域
     错误都不写趋势文件。省略这对参数时行为与旧版完全一致。
+
+    给定 ``proof_audit_output`` 时，在报告、检查点、连续性盘点、链级延迟
+    画像、延迟越界清单、链级 SLO 汇总与链级时间窗口趋势画像（若有）都安全
+    发布之后，**最后**再原子替换一份轻客户端证明校验审计画像（UTF-8
+    JSONL；详见 :func:`_build_proof_audit`）。画像按输入行序为当前完整输入
+    的全部结构合法事件各写一行，而非游标后的新行，故续传、追加与重复执行
+    结果一致，空输入原子写空文件。行字段为 event_id、chain_id、sequence、
+    proof_status、light_client_version、provided_signature_count、
+    unique_signature_count、quorum、checks、failed_checks、finalized_at；
+    checks 的三个布尔键依次为 quorum_sufficient、validator_set_hash_matches、
+    trusted_root_matches_header，各自复用 verify_proof 的同一条现有规则，
+    failed_checks 仅按序列出 false 项，全通过为 []。画像为只读推导，不参与
+    游标或汇总、不改任何既有输出（含输入前缀摘要）；隔离模式下成功与失败
+    事件都入画像，报告失败行仍含 error_type/error_message，审计行
+    proof_status 为 failed；严格模式证明失败（含游标覆盖的历史失败事件）
+    仍在任何发布之前抛 ProofVerificationError，不写画像。结构错误、同链
+    重复 sequence、时间顺序错误与检查点不合规同样在任何发布之前抛出，不写
+    画像。省略该参数时行为与旧版完全一致；路径不可写等文件错误原样作为
+    OSError 子类传播，CLI 为固定 JSON 与非零退出，此前已发布的产物不受
+    影响。
     """
     if (latency_thresholds is None) != (latency_breach_output is None):
         raise InvalidInputError(
@@ -1595,6 +1723,14 @@ def watch(
             events, trend_window_ms, tolerate_failures
         )
 
+    # 轻客户端证明审计画像同样最后发布，但其结果在任何发布之前就由全部
+    # 结构合法事件算好：严格模式下被选事件在处理循环中先暴露失败，此处再
+    # 覆盖游标之前的历史事件（例如先前以隔离模式处理、本次改为严格模式
+    # 续传），与链级 SLO 汇总和趋势画像同口径，绝不先发布再失败。
+    proof_audit_rows: Optional[list[dict]] = None
+    if proof_audit_output is not None:
+        proof_audit_rows = _build_proof_audit(events, tolerate_failures)
+
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
     # 事件；续传时累积发布按 (chain_id, sequence) 去重，因此即便重选也不会
     # 写两次。全新开始总是写一份完整报告，覆盖输出路径上的陈旧文件。
@@ -1669,6 +1805,14 @@ def watch(
     if trend_output is not None:
         _atomic_write(trend_output, _render_reports(trend_rows))
 
+    # 轻客户端证明审计画像最后发布：结果已在任何发布之前由全部结构合法
+    # 事件算好（含隔离模式的失败行），与游标无关，故空批（无新事件）也
+    # 照常写出同一内容，空输入写空文件；此处只负责最后一次原子替换。
+    if proof_audit_output is not None:
+        _atomic_write(
+            proof_audit_output, _render_reports(proof_audit_rows)
+        )
+
     return reports
 
 
@@ -1685,6 +1829,7 @@ def run(
     chain_health_output: Optional[PathLike] = None,
     trend_window_ms: Optional[int] = None,
     trend_output: Optional[PathLike] = None,
+    proof_audit_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
@@ -1702,6 +1847,9 @@ def run(
     ``trend_window_ms`` 与 ``trend_output`` 成对给定时最后原子写出链级
     时间窗口趋势画像（按 finalized_at 分窗口，每窗口一行的事件数、证明
     失败数、归因计数与三 p95，口径见 :func:`watch` 与 :func:`_build_trend`）。
+    ``proof_audit_output`` 给定时在所有既有输出安全发布后最后原子写出轻
+    客户端证明校验审计画像（按输入行序为全部结构合法事件各写一行，字段与
+    检查口径见 :func:`watch` 与 :func:`_build_proof_audit`）。
     """
     return watch(
         input,
@@ -1716,4 +1864,5 @@ def run(
         chain_health_output,
         trend_window_ms,
         trend_output,
+        proof_audit_output,
     )
