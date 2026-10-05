@@ -5,6 +5,7 @@ relay-watch --input IN --checkpoint CP --output OUT
     [--latency-thresholds PATH --latency-breach-output PATH]
     [--latency-profile-output PATH]
     [--chain-slo-thresholds PATH --chain-health-output PATH]
+    [--trend-window-ms N --trend-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -51,6 +52,21 @@ def _tolerate_failures_value(value: str) -> bool:
         return False
     # argparse 会在此消息前补 "argument --tolerate-failures: "。
     raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
+def _positive_ms_value(value: str) -> int:
+    """解析趋势窗口宽度：仅接受 >=1 的整数毫秒（拒绝浮点、符号、空白等）。"""
+    if not value or not all("0" <= char <= "9" for char in value):
+        # argparse 会在此消息前补 "argument --trend-window-ms: "。
+        raise argparse.ArgumentTypeError(
+            "must be an integer number of milliseconds"
+        )
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            "must be greater than or equal to 1"
+        )
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -175,6 +191,36 @@ def build_parser() -> argparse.ArgumentParser:
             "计入失败率与 p95；省略时不生成"
         ),
     )
+    parser.add_argument(
+        "--trend-window-ms",
+        metavar="N",
+        default=None,
+        type=_positive_ms_value,
+        help=(
+            "可选：链级时间窗口趋势画像的窗口宽度（大于等于 1 的整数"
+            "毫秒）。window_start_ms 取不大于 finalized_at 的最大 N 的"
+            "整数倍，按 chain_id 与该起点合并，空窗口不输出。必须与 "
+            "--trend-output 成对给出"
+        ),
+    )
+    parser.add_argument(
+        "--trend-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：链级时间窗口趋势画像输出路径（所有既有输出都安全发布"
+            "后最后原子替换的 UTF-8 JSONL）。按 chain_id 首次出现顺序、"
+            "链内窗口起点升序每窗口一行，覆盖当前输入全部结构合法事件"
+            "而非游标后的新行，空输入写空文件；字段为 chain_id、"
+            "window_start_ms、event_count、proof_failure_count、"
+            "attribution_counts（仅含 source、relay、destination）与"
+            "latency_p95_ms（三个 p95 各仅含 proof_latency_ms、"
+            "relay_latency_ms、destination_latency_ms，取窗口事件最近秩"
+            "max(1,ceil(0.95*n))）。隔离模式 proof_status=failed 的事件"
+            "计入 event_count 并另计 proof_failure_count。必须与 "
+            "--trend-window-ms 成对给出"
+        ),
+    )
     return parser
 
 
@@ -201,6 +247,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "given together"
         )
 
+    # 链级时间窗口趋势画像两参数同样必须成对；窗口宽度的语法与取值错误
+    # 已由 argparse 的 type=_positive_ms_value 以同一固定 JSON 口径拒绝。
+    if (args.trend_window_ms is None) != (args.trend_output is None):
+        parser.error(
+            "--trend-window-ms and --trend-output must be given together"
+        )
+
     try:
         run(
             args.input,
@@ -213,6 +266,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             latency_profile_output=args.latency_profile_output,
             chain_slo_thresholds=args.chain_slo_thresholds,
             chain_health_output=args.chain_health_output,
+            trend_window_ms=args.trend_window_ms,
+            trend_output=args.trend_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))

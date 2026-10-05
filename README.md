@@ -11,7 +11,44 @@
 已实现：UTF-8 JSONL 离线读取、自描述轻客户端证明校验、三段延迟与归因、
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
 输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
-可选的延迟越界清单；可选的链级延迟画像；可选的链级 SLO 汇总。
+可选的延迟越界清单；可选的链级延迟画像；可选的链级 SLO 汇总；可选的链级
+时间窗口趋势画像。
+
+## 链级时间窗口趋势画像
+
+成对传入 `--trend-window-ms N --trend-output PATH`（模块 API 为
+`run(..., trend_window_ms=N, trend_output=PATH)`）后，在报告、检查点、
+连续性盘点、链级延迟画像、延迟越界清单（若有）与链级 SLO 汇总（若有）都
+安全发布之后，**最后**原子替换一份 UTF-8 JSONL 趋势画像；两个参数缺一不
+可（CLI 以 `InvalidArgument` 固定 JSON、退出码 2 报错；API 抛
+`InvalidInputError`）。画像按 `chain_id` 在输入中的首次出现顺序、链内按
+窗口起点升序，每个非空窗口一行；覆盖**当前输入全部结构合法事件**而非游标
+后的新行，因此续传、追加与重复执行结果一致，空输入原子写空文件。
+
+- 窗口宽度 `N` 仅接受大于等于 1 的整数毫秒；缺参、未知参数、语法错误
+  （非整数、浮点、布尔、符号、空白等）或宽度错误（`0`、负数）CLI 一律
+  输出固定 `InvalidArgument` JSON 并以退出码 2 退出，API 抛
+  `InvalidInputError`。
+- `window_start_ms` 取不大于 `finalized_at` 的最大 `N` 的整数倍
+  （`finalized_at // N * N`），按 `chain_id` 与该起点合并；没有事件落入
+  的空窗口不输出。
+- 每行字段为 `chain_id`、`window_start_ms`、`event_count`、
+  `proof_failure_count`、`attribution_counts`、`latency_p95_ms`。
+- `event_count` 为该窗口事件数，`proof_failure_count` 为其中证明失败数；
+  `attribution_counts` 仅含 `source`、`relay`、`destination` 三个键，
+  归因沿用单事件口径，未出现写 0。
+- `latency_p95_ms` 仅含三个整数键 `proof_latency_ms`、`relay_latency_ms`、
+  `destination_latency_ms`，各取该窗口事件对应延迟的最近秩 p95
+  `max(1,ceil(0.95*n))`（`n` 为窗口事件数）。
+- 隔离模式（`--tolerate-failures true`）下成功与失败事件都计入
+  `event_count`，失败事件另计 `proof_failure_count`，三段延迟与归因同口
+  径；严格模式证明失败仍抛 `ProofVerificationError`，报告、检查点、连续性
+  盘点、画像、越界清单、SLO 汇总和趋势画像都不写。
+- 同链 `sequence` 重复、时间字段非法、输入或检查点不合规仍抛
+  `InvalidInputError` 或 `CheckpointError`，沿用现有异常退出码且不写趋势
+  文件。趋势不参与游标，也不改任何既有输出；省略这对参数时报告、检查点、
+  异常与退出码与旧版完全一致。趋势路径不可写等文件错误沿用 CLI 的
+  OSError 子类固定 JSON 错误与非零退出（此前已发布的产物不受影响）。
 
 ## 链级 SLO 汇总
 

@@ -4767,3 +4767,755 @@ def test_chain_health_strict_rerun_over_isolated_history_raises_before_publish(
     assert health.read_text() == health_before
     # The previously published report is left untouched on the failure.
     assert workspace["output"].read_text() == output_before
+
+
+# ---------------------------------------------------------------------------
+# Chain-level time-window trend profile (trend_window_ms / trend_output)
+# --------------------------------------------------------------------------- #
+
+
+TREND_PATH_NAME = "trend.jsonl"
+
+
+def read_trend(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def trend_event(
+    chain_id,
+    sequence,
+    event_id,
+    finalized_at,
+    *,
+    proof=400,
+    relay=500,
+    destination=400,
+    failing=False,
+):
+    """A verifiable event pinned to an exact finalized_at and latencies.
+
+    verify/finalize and submit/verify order is enforced (proof, destination
+    >= 0); observed may sit anywhere. Constant latency offsets keep every
+    timestamp column globally unique as long as finalized_at values differ.
+    """
+    verify = finalized_at - destination
+    submit = verify - proof
+    observed = verify - relay
+    overrides = (
+        dict(signatures=["0xaa11"], quorum=2) if failing else {}
+    )
+    return on_chain(
+        chain_id,
+        event_id=event_id,
+        sequence=sequence,
+        observed_at=observed,
+        proof_submitted_at=submit,
+        proof_verified_at=verify,
+        finalized_at=finalized_at,
+        **overrides,
+    )
+
+
+def run_trend(workspace, window_ms, events=None, **kwargs):
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    if events is not None:
+        write_events(workspace["input"], events)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        trend_window_ms=window_ms,
+        trend_output=trend,
+        **kwargs,
+    )
+    return reports, trend
+
+
+def test_trend_single_window_fields_counts_and_p95(workspace):
+    events = [
+        trend_event("chain-a", 1, "A1", 11_500),
+        trend_event("chain-a", 2, "A2", 12_500),
+    ]
+    _reports, trend = run_trend(workspace, 10_000, events)
+
+    rows = read_trend(trend)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "window_start_ms": 10_000,
+            "event_count": 2,
+            "proof_failure_count": 0,
+            "attribution_counts": {
+                "source": 0,
+                "relay": 2,
+                "destination": 0,
+            },
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+        }
+    ]
+    assert set(rows[0]) == {
+        "chain_id",
+        "window_start_ms",
+        "event_count",
+        "proof_failure_count",
+        "attribution_counts",
+        "latency_p95_ms",
+    }
+    assert set(rows[0]["attribution_counts"]) == {
+        "source",
+        "relay",
+        "destination",
+    }
+    assert set(rows[0]["latency_p95_ms"]) == {
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+    }
+
+
+def test_trend_window_start_is_floor_multiple_including_boundaries(workspace):
+    # -1 floors to -10000 (the greatest multiple not greater than finalized_at);
+    # 10000 and 19999 both belong to the window starting at 10000.
+    finals = [-1, 9_999, 10_000, 10_001, 19_999, 20_000]
+    events = [
+        trend_event("chain-a", i + 1, f"A{i + 1}", final)
+        for i, final in enumerate(finals)
+    ]
+    _reports, trend = run_trend(workspace, 10_000, events)
+
+    rows = read_trend(trend)
+    assert [r["window_start_ms"] for r in rows] == [
+        -10_000,
+        0,
+        10_000,
+        20_000,
+    ]
+    assert [r["event_count"] for r in rows] == [1, 1, 3, 1]
+    assert all(r["chain_id"] == "chain-a" for r in rows)
+
+
+def test_trend_empty_windows_are_not_emitted(workspace):
+    events = [
+        trend_event("chain-a", 1, "A1", 500),
+        trend_event("chain-a", 2, "A2", 2_500),
+    ]
+    _reports, trend = run_trend(workspace, 1_000, events)
+
+    rows = read_trend(trend)
+    # The window starting at 1000 carries no event and must not appear.
+    assert [r["window_start_ms"] for r in rows] == [0, 2_000]
+
+
+def test_trend_merges_by_chain_and_window_start(workspace):
+    events = [
+        trend_event("chain-a", 1, "A1", 11_500),
+        trend_event("chain-b", 1, "B1", 10_500),
+        trend_event("chain-a", 2, "A2", 12_500),
+        trend_event("chain-b", 2, "B2", 20_500),
+    ]
+    _reports, trend = run_trend(workspace, 10_000, events)
+
+    rows = read_trend(trend)
+    assert [
+        (r["chain_id"], r["window_start_ms"], r["event_count"]) for r in rows
+    ] == [
+        ("chain-a", 10_000, 2),
+        ("chain-b", 10_000, 1),
+        ("chain-b", 20_000, 1),
+    ]
+
+
+def test_trend_order_is_chain_first_appearance_then_window_start(workspace):
+    events = [
+        trend_event("chain-b", 1, "B1", 11_500),
+        trend_event("chain-a", 1, "A1", 11_600),
+        trend_event("chain-b", 2, "B2", 21_500),
+        trend_event("chain-a", 2, "A2", 500),
+    ]
+    _reports, trend = run_trend(workspace, 10_000, events)
+
+    rows = read_trend(trend)
+    assert [(r["chain_id"], r["window_start_ms"]) for r in rows] == [
+        ("chain-b", 10_000),
+        ("chain-b", 20_000),
+        ("chain-a", 0),
+        ("chain-a", 10_000),
+    ]
+
+
+def test_trend_p95_uses_nearest_rank_max_1_ceil_point95_n(workspace):
+    # 20 events in one window; proof latencies 10..200 ms, p95 rank 19 = 190.
+    events = [
+        trend_event(
+            "chain-a",
+            i + 1,
+            f"A{i + 1}",
+            2_000_000 + i * 50,
+            proof=(i + 1) * 10,
+            relay=100,
+        )
+        for i in range(20)
+    ]
+    _reports, trend = run_trend(workspace, 1_000_000, events)
+
+    rows = read_trend(trend)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["window_start_ms"] == 2_000_000
+    assert row["event_count"] == 20
+    assert row["latency_p95_ms"] == {
+        "proof_latency_ms": 190,
+        "relay_latency_ms": 100,
+        "destination_latency_ms": 400,
+    }
+
+
+def test_trend_attribution_counts_follow_single_event_convention(workspace):
+    events = [
+        trend_event("chain-a", 1, "A1", 500, proof=300, relay=100,
+                    destination=50),    # source
+        trend_event("chain-a", 2, "A2", 600, proof=60, relay=50,
+                    destination=400),   # destination
+        trend_event("chain-a", 3, "A3", 2_500, proof=10, relay=300,
+                    destination=20),    # relay
+    ]
+    _reports, trend = run_trend(workspace, 1_000, events)
+
+    rows = read_trend(trend)
+    assert [r["window_start_ms"] for r in rows] == [0, 2_000]
+    assert rows[0]["attribution_counts"] == {
+        "source": 1,
+        "relay": 0,
+        "destination": 1,
+    }
+    assert rows[1]["attribution_counts"] == {
+        "source": 0,
+        "relay": 1,
+        "destination": 0,
+    }
+
+
+def test_trend_isolation_mode_failed_rows_counted_per_window(workspace):
+    # three_mixed_events finalize at 1900/2900/3900 -> one window at 0 with
+    # N=10000; verified, failed, verified share the 400/500/400 block.
+    write_events(workspace["input"], three_mixed_events())
+    _reports, trend = run_trend(
+        workspace, 10_000, tolerate_failures=True
+    )
+
+    rows = read_trend(trend)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "window_start_ms": 0,
+            "event_count": 3,
+            "proof_failure_count": 1,
+            "attribution_counts": {
+                "source": 0,
+                "relay": 3,
+                "destination": 0,
+            },
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+        }
+    ]
+
+
+def test_trend_empty_input_atomically_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    trend.write_text("STALE\n", encoding="utf-8")
+
+    _reports, trend = run_trend(workspace, 10_000)
+
+    assert trend.exists()
+    assert trend.read_text(encoding="utf-8") == ""
+
+
+def test_trend_omitted_writes_nothing_and_behavior_unchanged(workspace):
+    write_events(workspace["input"], three_events())
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    reports = run(
+        workspace["input"], workspace["checkpoint"], workspace["output"]
+    )
+
+    assert [r["sequence"] for r in reports] == [1, 2, 3]
+    assert not trend.exists()
+    assert read_checkpoint(workspace) == v3_checkpoint(
+        {"chain-7": 3}, 3, full_digest(workspace["input"])
+    )
+
+
+def test_trend_covers_whole_input_across_resume_append_and_rerun(workspace):
+    first_batch = [
+        trend_event("chain-a", 1, "A1", 11_500),
+        trend_event("chain-a", 4, "A4", 12_500),
+    ]
+    write_events(workspace["input"], first_batch)
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        trend_window_ms=10_000,
+        trend_output=trend,
+    )
+    assert read_trend(trend) == [
+        {
+            "chain_id": "chain-a",
+            "window_start_ms": 10_000,
+            "event_count": 2,
+            "proof_failure_count": 0,
+            "attribution_counts": {
+                "source": 0,
+                "relay": 2,
+                "destination": 0,
+            },
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+        }
+    ]
+
+    second_batch = first_batch + [
+        trend_event("chain-a", 7, "A7", 21_500)
+    ]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        trend_window_ms=10_000,
+        trend_output=trend,
+    )
+    # Only the appended event is selected; the trend covers all three.
+    assert [r["sequence"] for r in reports] == [7]
+    expected = read_trend(trend)
+    assert [
+        (r["window_start_ms"], r["event_count"]) for r in expected
+    ] == [(10_000, 2), (20_000, 1)]
+
+    # A no-op rerun rewrites the identical trend.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        trend_window_ms=10_000,
+        trend_output=trend,
+    )
+    assert again == []
+    assert read_trend(trend) == expected
+
+
+def test_trend_atomically_replaces_stale_file(workspace):
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    trend.write_text("STALE\n", encoding="utf-8")
+    _reports, trend = run_trend(
+        workspace, 10_000, [trend_event("chain-7", 1, "E1", 11_500)]
+    )
+    rows = read_trend(trend)
+    assert len(rows) == 1
+    assert rows[0]["chain_id"] == "chain-7"
+
+
+def test_trend_arguments_must_be_paired_in_api(workspace):
+    write_events(workspace["input"], [make_event()])
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=10_000,
+        )
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_output=trend,
+        )
+    assert not trend.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+@pytest.mark.parametrize("width", [0, -1, 1.5, 1.0, True, "10000"])
+def test_trend_invalid_window_width_raises_invalid_input(workspace, width):
+    write_events(workspace["input"], [make_event()])
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=width,
+            trend_output=trend,
+        )
+    assert not trend.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_trend_window_width_one_is_valid(workspace):
+    # With N=1 every unique finalized_at lands in its own singleton window.
+    events = [
+        trend_event("chain-a", 1, "A1", 1_001),
+        trend_event("chain-a", 2, "A2", 1_002),
+    ]
+    _reports, trend = run_trend(workspace, 1, events)
+    rows = read_trend(trend)
+    assert [r["window_start_ms"] for r in rows] == [1_001, 1_002]
+    assert all(r["event_count"] == 1 for r in rows)
+
+
+def test_trend_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=10_000,
+            trend_output=trend,
+        )
+    assert not trend.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_trend_invalid_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=10_000,
+            trend_output=trend,
+        )
+    assert not trend.exists()
+
+
+def test_trend_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=10_000,
+            trend_output=trend,
+        )
+    assert not trend.exists()
+    assert not workspace["output"].exists()
+
+
+def test_trend_unwritable_path_raises_oserror_after_publish(workspace):
+    write_events(
+        workspace["input"],
+        [trend_event("chain-7", 1, "E1", 11_500)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    trend = blocked / TREND_PATH_NAME
+
+    with pytest.raises(OSError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            trend_window_ms=10_000,
+            trend_output=trend,
+        )
+
+    # The trend is published last: report and checkpoint are already safe.
+    assert not trend.exists()
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+
+
+def test_trend_strict_rerun_over_isolated_history_raises_before_publish(
+    workspace,
+):
+    # First run in isolation mode commits a failed row and writes the trend.
+    write_events(workspace["input"], three_mixed_events())
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        trend_window_ms=10_000,
+        trend_output=trend,
+    )
+    output_before = workspace["output"].read_text()
+    trend_before = trend.read_text()
+
+    # A later STRICT run must surface the historically failed proof before
+    # publishing anything; the trend and report are left byte-for-byte intact.
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=False,
+            trend_window_ms=10_000,
+            trend_output=trend,
+        )
+    assert trend.read_text() == trend_before
+    assert workspace["output"].read_text() == output_before
+
+
+def test_trend_does_not_change_any_other_output(workspace):
+    write_events(workspace["input"], [make_event()])
+    thresholds_path = workspace["output"].with_name("thresholds.json")
+    breach = workspace["output"].with_name("breach.jsonl")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    write_thresholds(thresholds_path, DEFAULT_THRESHOLDS)
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=workspace["output"].with_name("continuity.jsonl"),
+        latency_thresholds=thresholds_path,
+        latency_breach_output=breach,
+        latency_profile_output=profile,
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+        trend_window_ms=10_000,
+        trend_output=trend,
+    )
+
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert len(read_breaches(breach)) == 1
+    assert len(read_profile(profile)) == 1
+    assert len(read_health(health)) == 1
+    trend_rows = read_trend(trend)
+    assert len(trend_rows) == 1
+    # make_event finalizes at 2400 -> window starts at 0.
+    assert trend_rows[0]["window_start_ms"] == 0
+    assert trend_rows[0]["event_count"] == 1
+    assert trend_rows[0]["proof_failure_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Trend profile CLI
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_trend_output_success(workspace):
+    events = [
+        trend_event("chain-a", 1, "A1", 11_500),
+        trend_event("chain-a", 2, "A2", 12_500),
+    ]
+    write_events(workspace["input"], events)
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms", "10000",
+        "--trend-output", str(trend),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = read_trend(trend)
+    assert rows == [
+        {
+            "chain_id": "chain-a",
+            "window_start_ms": 10_000,
+            "event_count": 2,
+            "proof_failure_count": 0,
+            "attribution_counts": {
+                "source": 0,
+                "relay": 2,
+                "destination": 0,
+            },
+            "latency_p95_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--trend-window-ms", "10000"],
+        ["--trend-output", "trend.jsonl"],
+    ],
+)
+def test_cli_trend_arguments_must_be_paired(workspace, extra_args):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        *extra_args,
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] == "InvalidArgument"
+    assert not workspace["output"].with_name(TREND_PATH_NAME).exists()
+    assert not workspace["output"].exists()
+
+
+@pytest.mark.parametrize(
+    "width",
+    ["0", "-1", "1.5", "1e3", "abc", "+1", " 100", "0x10"],
+)
+def test_cli_trend_invalid_width_is_invalid_argument(workspace, width):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms", width,
+        "--trend-output", str(workspace["output"].with_name(TREND_PATH_NAME)),
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "InvalidArgument"
+    assert not workspace["output"].exists()
+
+
+def test_cli_trend_unknown_argument_is_invalid_argument(workspace):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-width-ms", "10000",
+        "--trend-output", str(workspace["output"].with_name(TREND_PATH_NAME)),
+    )
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["error"] == "InvalidArgument"
+    assert not workspace["output"].exists()
+
+
+def test_cli_trend_missing_width_value_is_invalid_argument(workspace):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms",
+        "--trend-output", str(workspace["output"].with_name(TREND_PATH_NAME)),
+    )
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["error"] == "InvalidArgument"
+
+
+def test_cli_trend_strict_failure_leaves_no_trend_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms", "10000",
+        "--trend-output", str(trend),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not trend.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_trend_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms", "10000",
+        "--trend-output", str(trend),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert trend.exists()
+    assert trend.read_text(encoding="utf-8") == ""
+
+
+def test_cli_trend_isolation_mode_counts_failed_rows(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+        "--trend-window-ms", "10000",
+        "--trend-output", str(trend),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rows = read_trend(trend)
+    assert len(rows) == 1
+    assert rows[0]["event_count"] == 3
+    assert rows[0]["proof_failure_count"] == 1
+
+
+def test_cli_trend_unwritable_path_is_oserror_json(workspace):
+    write_events(
+        workspace["input"],
+        [trend_event("chain-7", 1, "E1", 11_500)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    trend = blocked / TREND_PATH_NAME
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--trend-window-ms", "10000",
+        "--trend-output", str(trend),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+    # The trend is published last: every earlier artifact already exists.
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert not trend.exists()
