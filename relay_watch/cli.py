@@ -6,7 +6,7 @@ relay-watch --input IN --checkpoint CP --output OUT
     [--latency-profile-output PATH]
     [--chain-slo-thresholds PATH --chain-health-output PATH]
     [--trend-window-ms N --trend-output PATH]
-    [--proof-audit-output PATH]
+    [--proof-audit-output PATH] [--attribution-audit-output PATH]
 
 全程离线处理。任何领域错误都向标准错误写一个固定结构的 JSON 对象
 ``{"error": ..., "message": ...}``，以非零码退出，且绝不留下半成品报告。
@@ -243,6 +243,28 @@ def build_parser() -> argparse.ArgumentParser:
             "生成"
         ),
     )
+    parser.add_argument(
+        "--attribution-audit-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "可选：归因审计画像输出路径（所有既有输出都安全发布后最后原子"
+            "替换的 UTF-8 JSONL）。按输入行序为当前完整输入的全部结构合法"
+            "事件各写一行而非游标后的新行，续传、追加、重复执行结果一致，"
+            "空输入写空文件；字段为 event_id、chain_id、sequence、"
+            "proof_status、latency_ms（仅含 proof_latency_ms、"
+            "relay_latency_ms、destination_latency_ms）、attribution"
+            "（最大非负延迟阶段，并列最高归 source）、"
+            "attribution_candidates（按 source、relay、destination 列出"
+            "全部并列最高）、attribution_gap_ms（第一与第二高非负延迟之"
+            "差，并列为 0）、negative_stages（同序列出负延迟阶段，无为 "
+            "[]）与 finalized_at。隔离模式成功与失败事件都入画像"
+            "（proof_status=failed）；严格模式证明失败仍抛 "
+            "ProofVerificationError 且不写画像；结构/检查点错误同样不写。"
+            "画像只读推导，不参与游标、汇总，不改任何既有输出；省略时不"
+            "生成"
+        ),
+    )
     return parser
 
 
@@ -291,6 +313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             trend_window_ms=args.trend_window_ms,
             trend_output=args.trend_output,
             proof_audit_output=args.proof_audit_output,
+            attribution_audit_output=args.attribution_audit_output,
         )
     except ProofVerificationError as exc:
         emit_error("ProofVerificationError", str(exc))
