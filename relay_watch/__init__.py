@@ -114,6 +114,28 @@ JSON 与退出码不变。省略该参数时既有结果完全不变；画像路
 文件错误沿用 CLI 的 OSError 子类固定 JSON 错误与非零退出（此前已发布
 的产物不受影响）。
 
+可选的延迟归因审计画像（``attribution_audit_output`` /
+``--attribution-audit-output``）在报告、检查点、连续性盘点、链级延迟
+画像、延迟越界清单、链级 SLO 汇总、链级时间窗口趋势画像与轻客户端证明
+校验审计画像（若有）均安全发布后**最后**原子替换：UTF-8 JSONL，按输入
+行序为当前完整输入的全部结构合法事件各写一行（而非游标后的新行），续传、
+追加、重复执行结果一致，空输入写空文件。行字段为 event_id、chain_id、
+sequence、proof_status、latency_ms、attribution、
+attribution_candidates、attribution_gap_ms、negative_stages、
+finalized_at。latency_ms 仅含 proof_latency_ms、relay_latency_ms、
+destination_latency_ms 三个有符号整数毫秒（口径与报告行一致）；
+attribution 沿用最大非负延迟、并列归 relay 的现有归因；
+attribution_candidates 按 source、relay、destination 顺序列出非负延迟
+中并列最高的全部阶段（唯一最高仅一项）；attribution_gap_ms 为非负延迟
+第一高与第二高之差，并列时为 0；negative_stages 按同序列出负延迟阶段，
+无负值为 []。归因审计画像是只读推导，不参与游标或汇总，不改报告、检查
+点、输入前缀摘要与任何既有输出；隔离模式成功与失败事件都入画像
+（proof_status=failed），严格模式证明失败（含游标覆盖的历史失败事件）
+仍在任何发布前抛 ProofVerificationError 且不写画像；结构错误、同链重复
+sequence、时间顺序错误、检查点不合规同样不写画像，CLI 错误 JSON 与退出
+码不变。省略该参数时既有结果完全不变；画像路径不可写等文件错误沿用 CLI
+的 OSError 子类固定 JSON 错误与非零退出（此前已发布的产物不受影响）。
+
 公共入口：
 
 * ``relay_watch.run(input, checkpoint=None, output=None,
@@ -121,7 +143,7 @@ JSON 与退出码不变。省略该参数时既有结果完全不变；画像路
   latency_thresholds=None, latency_breach_output=None,
   latency_profile_output=None, chain_slo_thresholds=None,
   chain_health_output=None, trend_window_ms=None, trend_output=None,
-  proof_audit_output=None)``
+  proof_audit_output=None, attribution_audit_output=None)``
   -> list[dict]
   与命令行同参的模块 API；
 * ``python -m relay_watch --input IN --checkpoint CP --output OUT
@@ -130,7 +152,8 @@ JSON 与退出码不变。省略该参数时既有结果完全不变；画像路
   [--latency-profile-output PATH]
   [--chain-slo-thresholds PATH --chain-health-output PATH]
   [--trend-window-ms N --trend-output PATH]
-  [--proof-audit-output PATH]``；
+  [--proof-audit-output PATH]
+  [--attribution-audit-output PATH]``；
 * ``relay-watch`` 可执行文件。
 """
 

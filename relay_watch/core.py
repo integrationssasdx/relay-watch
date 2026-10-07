@@ -110,6 +110,29 @@ trusted_root_matches_header，各自复用 verify_proof 的同一条现有规则
 任何发布之前抛出，CLI 错误 JSON 与退出码不变且不写画像。省略该参数时
 行为与旧版完全一致；审计路径不可写等文件错误原样作为 OSError 子类传播
 （CLI 为固定 JSON 与非零退出），此前已发布的产物不受影响。
+
+可选的延迟归因审计画像（``attribution_audit_output``）在报告、检查点、
+连续性盘点、链级延迟画像、延迟越界清单、链级 SLO 汇总、链级时间窗口
+趋势画像与轻客户端证明校验审计画像均安全发布后**最后**原子替换：UTF-8
+JSONL，按输入行序为全部结构合法事件各写一行，覆盖当前完整输入而非游标
+后的新行，续传、追加、重复执行与空输入（空文件）结果一致。行字段为
+event_id、chain_id、sequence、proof_status、latency_ms、attribution、
+attribution_candidates、attribution_gap_ms、negative_stages、
+finalized_at。latency_ms 仅含 proof_latency_ms、relay_latency_ms、
+destination_latency_ms 三个有符号整数毫秒（口径与报告行一致）；
+attribution 沿用现有归因（最大非负延迟，并列归 relay）。
+attribution_candidates 按 source、relay、destination 的固定顺序列出
+非负延迟中与最高延迟并列的全部阶段名（唯一最高时仅一项）；
+attribution_gap_ms 为非负延迟第一高与第二高之差（并列、含三项全等或
+最高出现多次时为 0）；negative_stages 同序列出值为负的延迟阶段名，
+否则为 ``[]``。审计画像是只读推导：不参与游标或汇总，不改报告、检查点、
+输入前缀摘要或任何既有输出。隔离模式下成功与失败事件都入画像，失败行
+proof_status 为 failed；严格模式证明失败仍在任何发布之前抛
+ProofVerificationError 且不写画像（含游标覆盖的历史事件）；结构错误、
+同链重复 sequence、时间顺序错误、检查点不合规同样在任何发布之前抛出，
+CLI 错误 JSON 与退出码不变且不写画像。省略该参数时行为与旧版完全一致；
+审计路径不可写等文件错误原样作为 OSError 子类传播（CLI 为固定 JSON 与
+非零退出），此前已发布的产物不受影响。
 """
 
 from __future__ import annotations
@@ -1512,6 +1535,81 @@ def _build_proof_audit(
 
 
 # --------------------------------------------------------------------------- #
+# 延迟归因审计画像
+# --------------------------------------------------------------------------- #
+def _build_attribution_audit(
+    events: list[dict], tolerate_failures: bool
+) -> list[dict]:
+    """按输入行序为每个结构合法事件生成一行归因审计，覆盖整个当前输入。
+
+    每行暴露归因是否唯一最高：latency_ms 仅含三段有符号延迟（与报告行同一
+    口径）；attribution 沿用现有归因（最大非负延迟，并列归 relay）；
+    attribution_candidates 按 source、relay、destination 的固定顺序列出
+    非负延迟中并列最高的全部阶段；attribution_gap_ms 为非负延迟第一高与
+    第二高之差，最高出现多次（并列）时为 0；negative_stages 按同序列出值
+    为负的延迟阶段名，无负值时为 []。
+
+    proof_status 与轻客户端证明审计同口径：三项检查全部通过才 verified。
+    隔离模式（tolerate_failures=True）下成功与失败事件都入画像；严格模式
+    遇到证明失败直接抛 ProofVerificationError——与处理循环及其他「覆盖全
+    输入」的附加产物同口径，游标覆盖的历史失败事件也在此暴露。
+    """
+    rows: list[dict] = []
+    for event in events:
+        proof_latency = event["proof_verified_at"] - event["proof_submitted_at"]
+        relay_latency = event["proof_verified_at"] - event["observed_at"]
+        destination_latency = (
+            event["finalized_at"] - event["proof_verified_at"]
+        )
+        stages = [
+            (_SOURCE, proof_latency),
+            (_RELAY, relay_latency),
+            (_DESTINATION, destination_latency),
+        ]
+        non_negative_values = sorted(
+            (value for _name, value in stages if value >= 0), reverse=True
+        )
+        highest = non_negative_values[0]
+        candidates = [
+            name for name, value in stages if value >= 0 and value == highest
+        ]
+        # 最高出现多次（含三项全等）即并列：第一高与第二高之差为 0。
+        gap = (
+            non_negative_values[0] - non_negative_values[1]
+            if len(non_negative_values) > 1
+            else 0
+        )
+        negative_stages = [name for name, value in stages if value < 0]
+
+        checks = _proof_audit_checks(event)
+        verified = all(checks.values())
+        if not verified and not tolerate_failures:
+            verify_proof(event)  # 抛出具体的 ProofVerificationError
+
+        rows.append(
+            {
+                "event_id": event["event_id"],
+                "chain_id": event["chain_id"],
+                "sequence": event["sequence"],
+                "proof_status": "verified" if verified else "failed",
+                "latency_ms": {
+                    "proof_latency_ms": proof_latency,
+                    "relay_latency_ms": relay_latency,
+                    "destination_latency_ms": destination_latency,
+                },
+                "attribution": _attribution(
+                    proof_latency, relay_latency, destination_latency
+                ),
+                "attribution_candidates": candidates,
+                "attribution_gap_ms": gap,
+                "negative_stages": negative_stages,
+                "finalized_at": event["finalized_at"],
+            }
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # 公共管线
 # --------------------------------------------------------------------------- #
 def _render_checkpoint(
@@ -1540,6 +1638,7 @@ def watch(
     trend_window_ms: Optional[int] = None,
     trend_output: Optional[PathLike] = None,
     proof_audit_output: Optional[PathLike] = None,
+    attribution_audit_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """运行监控并返回逐事件报告行（按输入行序）。
 
@@ -1636,6 +1735,27 @@ def watch(
     画像。省略该参数时行为与旧版完全一致；路径不可写等文件错误原样作为
     OSError 子类传播，CLI 为固定 JSON 与非零退出，此前已发布的产物不受
     影响。
+
+    给定 ``attribution_audit_output`` 时，在报告、检查点、连续性盘点、
+    链级延迟画像、延迟越界清单、链级 SLO 汇总、链级时间窗口趋势画像与轻
+    客户端证明校验审计画像（若有）都安全发布之后，**最后**再原子替换一份
+    延迟归因审计画像（UTF-8 JSONL；详见 :func:`_build_attribution_audit`）。
+    画像按输入行序为当前完整输入的全部结构合法事件各写一行，而非游标后的
+    新行，故续传、追加与重复执行结果一致，空输入原子写空文件。行字段为
+    event_id、chain_id、sequence、proof_status、latency_ms（仅含
+    proof_latency_ms、relay_latency_ms、destination_latency_ms 三个有符号
+    整数毫秒，口径与报告行一致）、attribution（沿用最大非负延迟、并列归
+    relay 的现有归因）、attribution_candidates（按 source、relay、
+    destination 顺序列出非负延迟中并列最高的全部阶段，唯一最高时仅一项）、
+    attribution_gap_ms（非负延迟第一高与第二高之差，并列时为 0）、
+    negative_stages（按同序列出负延迟阶段，无负值为 []）与 finalized_at。
+    画像为只读推导，不参与游标或汇总、不改任何既有输出（含输入前缀摘要）；
+    隔离模式下成功与失败事件都入画像，审计行 proof_status 为 failed；严格
+    模式证明失败（含游标覆盖的历史失败事件）仍在任何发布之前抛
+    ProofVerificationError，不写画像。结构错误、同链重复 sequence、时间
+    顺序错误与检查点不合规同样在任何发布之前抛出，不写画像。省略该参数时
+    行为与旧版完全一致；路径不可写等文件错误原样作为 OSError 子类传播，
+    CLI 为固定 JSON 与非零退出，此前已发布的产物不受影响。
     """
     if (latency_thresholds is None) != (latency_breach_output is None):
         raise InvalidInputError(
@@ -1731,6 +1851,17 @@ def watch(
     if proof_audit_output is not None:
         proof_audit_rows = _build_proof_audit(events, tolerate_failures)
 
+    # 延迟归因审计画像同样最后发布，但其结果在任何发布之前就由全部结构
+    # 合法事件算好：严格模式下被选事件在处理循环中先暴露失败，此处再覆盖
+    # 游标之前的历史事件（例如先前以隔离模式处理、本次改为严格模式续
+    # 传），与证明审计画像、链级 SLO 汇总和趋势画像同口径，绝不先发布再
+    # 失败。
+    attribution_audit_rows: Optional[list[dict]] = None
+    if attribution_audit_output is not None:
+        attribution_audit_rows = _build_attribution_audit(
+            events, tolerate_failures
+        )
+
     # 先发布输出、再推进检查点：二者之间崩溃只会让下次重选行，绝不静默丢
     # 事件；续传时累积发布按 (chain_id, sequence) 去重，因此即便重选也不会
     # 写两次。全新开始总是写一份完整报告，覆盖输出路径上的陈旧文件。
@@ -1813,6 +1944,15 @@ def watch(
             proof_audit_output, _render_reports(proof_audit_rows)
         )
 
+    # 延迟归因审计画像最后发布：结果已在任何发布之前由全部结构合法事件算
+    # 好（含隔离模式的失败行），与游标无关，故空批（无新事件）也照常写出
+    # 同一内容，空输入写空文件；此处只负责最后一次原子替换。
+    if attribution_audit_output is not None:
+        _atomic_write(
+            attribution_audit_output,
+            _render_reports(attribution_audit_rows),
+        )
+
     return reports
 
 
@@ -1830,6 +1970,7 @@ def run(
     trend_window_ms: Optional[int] = None,
     trend_output: Optional[PathLike] = None,
     proof_audit_output: Optional[PathLike] = None,
+    attribution_audit_output: Optional[PathLike] = None,
 ) -> list[dict]:
     """模块 API，与 ``relay-watch --input --checkpoint --output`` 同参。
 
@@ -1849,7 +1990,11 @@ def run(
     失败数、归因计数与三 p95，口径见 :func:`watch` 与 :func:`_build_trend`）。
     ``proof_audit_output`` 给定时在所有既有输出安全发布后最后原子写出轻
     客户端证明校验审计画像（按输入行序为全部结构合法事件各写一行，字段与
-    检查口径见 :func:`watch` 与 :func:`_build_proof_audit`）。
+    检查口径见 :func:`watch` 与 :func:`_build_proof_audit`）；
+    ``attribution_audit_output`` 给定时在所有既有输出（含证明审计画像）安
+    全发布后最后原子写出延迟归因审计画像（按输入行序为全部结构合法事件各
+    写一行，暴露归因是否唯一最高、并列最高候选、与第二高的差距及负延迟阶
+    段，字段与口径见 :func:`watch` 与 :func:`_build_attribution_audit`）。
     """
     return watch(
         input,
@@ -1865,4 +2010,5 @@ def run(
         trend_window_ms,
         trend_output,
         proof_audit_output,
+        attribution_audit_output,
     )

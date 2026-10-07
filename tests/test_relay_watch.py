@@ -6159,3 +6159,703 @@ def test_cli_audit_omitted_keeps_behavior(workspace):
     )
     assert result.returncode == 0, result.stderr
     assert not workspace["output"].with_name(AUDIT_PATH_NAME).exists()
+
+# ---------------------------------------------------------------------------
+# Latency attribution audit profile (attribution_audit_output)
+# ---------------------------------------------------------------------------
+
+
+ATTR_AUDIT_PATH_NAME = "attribution-audit.jsonl"
+
+
+def read_attribution_audit(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def attr_event(
+    chain_id,
+    sequence,
+    event_id,
+    base,
+    *,
+    obs=0,
+    submit=100,
+    verify=500,
+    finalize=900,
+    **proof_overrides,
+):
+    """A structure-valid event with explicit offsets off ``base``.
+
+    Absolute timestamps are base+offset; spacing bases >= 1000 apart while
+    offsets stay inside (-900, 900) keeps every time column globally unique.
+    Defaults match chain_event: proof=400, relay=500, destination=400.
+    """
+    return on_chain(
+        chain_id,
+        event_id=event_id,
+        sequence=sequence,
+        observed_at=base + obs,
+        proof_submitted_at=base + submit,
+        proof_verified_at=base + verify,
+        finalized_at=base + finalize,
+        **proof_overrides,
+    )
+
+
+def run_attribution_audit(workspace, events=None, **kwargs):
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    if events is not None:
+        write_events(workspace["input"], events)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        attribution_audit_output=audit,
+        **kwargs,
+    )
+    return reports, audit
+
+
+def test_attribution_audit_verified_row_fields(workspace):
+    # Default time block: proof 400, relay 500 (unique max), destination 400.
+    write_events(
+        workspace["input"],
+        [attr_event("chain-7", 1, "E1", 1000)],
+    )
+    reports, audit = run_attribution_audit(workspace)
+
+    rows = read_attribution_audit(audit)
+    assert rows == [
+        {
+            "event_id": "E1",
+            "chain_id": "chain-7",
+            "sequence": 1,
+            "proof_status": "verified",
+            "latency_ms": {
+                "proof_latency_ms": 400,
+                "relay_latency_ms": 500,
+                "destination_latency_ms": 400,
+            },
+            "attribution": "relay",
+            "attribution_candidates": ["relay"],
+            "attribution_gap_ms": 100,
+            "negative_stages": [],
+            "finalized_at": 1900,
+        }
+    ]
+    assert set(rows[0]) == {
+        "event_id",
+        "chain_id",
+        "sequence",
+        "proof_status",
+        "latency_ms",
+        "attribution",
+        "attribution_candidates",
+        "attribution_gap_ms",
+        "negative_stages",
+        "finalized_at",
+    }
+    assert list(rows[0]["latency_ms"]) == [
+        "proof_latency_ms",
+        "relay_latency_ms",
+        "destination_latency_ms",
+    ]
+    # The nested latencies and attribution match the report row verbatim.
+    assert rows[0]["latency_ms"] == {
+        "proof_latency_ms": reports[0]["proof_latency_ms"],
+        "relay_latency_ms": reports[0]["relay_latency_ms"],
+        "destination_latency_ms": reports[0]["destination_latency_ms"],
+    }
+    assert rows[0]["attribution"] == reports[0]["attribution"]
+
+
+def test_attribution_audit_unique_max_for_each_stage(workspace):
+    events = [
+        # source unique max: proof 700, relay 300, destination 100.
+        attr_event("chain-a", 1, "S", 1000, obs=500, submit=100,
+                   verify=800, finalize=900),
+        # relay unique max: proof 100, relay 400, destination 300.
+        attr_event("chain-a", 2, "R", 2000, obs=100, submit=400,
+                   verify=500, finalize=800),
+        # destination unique max: proof 100, relay 200, destination 700.
+        attr_event("chain-a", 3, "D", 3000, obs=0, submit=100,
+                   verify=200, finalize=900),
+    ]
+    write_events(workspace["input"], events)
+    _reports, audit = run_attribution_audit(workspace)
+
+    rows = read_attribution_audit(audit)
+    assert [r["attribution"] for r in rows] == [
+        "source",
+        "relay",
+        "destination",
+    ]
+    assert [r["attribution_candidates"] for r in rows] == [
+        ["source"],
+        ["relay"],
+        ["destination"],
+    ]
+    # Gaps are first minus second non-negative latency.
+    assert [r["attribution_gap_ms"] for r in rows] == [
+        700 - 300,
+        400 - 300,
+        700 - 200,
+    ]
+    assert all(r["negative_stages"] == [] for r in rows)
+
+
+def test_attribution_audit_ties_list_all_maxima_in_fixed_order_with_gap_zero(
+    workspace,
+):
+    events = [
+        # source == relay > destination: both 400.
+        attr_event("chain-a", 1, "T1", 1000, obs=100, submit=100,
+                   verify=500, finalize=600),
+        # relay == destination > source: both 300, proof 200.
+        attr_event("chain-a", 2, "T2", 2000, obs=200, submit=300,
+                   verify=500, finalize=800),
+        # all three equal at 400.
+        attr_event("chain-a", 3, "T3", 3000, obs=100, submit=100,
+                   verify=500, finalize=900),
+        # source == destination at 400 while relay is negative (-100).
+        attr_event("chain-a", 4, "T4", 4000, obs=600, submit=100,
+                   verify=500, finalize=900),
+        # all stages zero (all instants coincide).
+        attr_event("chain-a", 5, "T5", 5000, obs=0, submit=0,
+                   verify=0, finalize=0),
+    ]
+    write_events(workspace["input"], events)
+    _reports, audit = run_attribution_audit(workspace)
+
+    rows = read_attribution_audit(audit)
+    assert [r["attribution_candidates"] for r in rows] == [
+        ["source", "relay"],
+        ["relay", "destination"],
+        ["source", "relay", "destination"],
+        ["source", "destination"],
+        ["source", "relay", "destination"],
+    ]
+    # Any tie resolves to relay and carries a zero gap.
+    assert all(r["attribution"] == "relay" for r in rows)
+    assert all(r["attribution_gap_ms"] == 0 for r in rows)
+    assert [r["negative_stages"] for r in rows] == [
+        [],
+        [],
+        [],
+        ["relay"],
+        [],
+    ]
+    assert rows[3]["latency_ms"] == {
+        "proof_latency_ms": 400,
+        "relay_latency_ms": -100,
+        "destination_latency_ms": 400,
+    }
+
+
+def test_attribution_audit_gap_ignores_negative_latency(workspace):
+    # proof 400, relay -100 (negative), destination 300: the gap compares the
+    # two non-negative stages (400 vs 300), not the negative one.
+    event = attr_event(
+        "chain-a", 1, "E1", 1000, obs=600, submit=100, verify=500,
+        finalize=800,
+    )
+    write_events(workspace["input"], [event])
+    _reports, audit = run_attribution_audit(workspace)
+
+    row = read_attribution_audit(audit)[0]
+    assert row["latency_ms"] == {
+        "proof_latency_ms": 400,
+        "relay_latency_ms": -100,
+        "destination_latency_ms": 300,
+    }
+    assert row["attribution"] == "source"
+    assert row["attribution_candidates"] == ["source"]
+    assert row["attribution_gap_ms"] == 100
+    assert row["negative_stages"] == ["relay"]
+
+
+def test_attribution_audit_zero_relay_is_non_negative_and_ties(workspace):
+    # Observation exactly at verification -> relay latency 0 (not negative).
+    event = attr_event(
+        "chain-a", 1, "E1", 1000, obs=500, submit=400, verify=500,
+        finalize=600,
+    )  # proof 100, relay 0, destination 100
+    write_events(workspace["input"], [event])
+    _reports, audit = run_attribution_audit(workspace)
+
+    row = read_attribution_audit(audit)[0]
+    assert row["latency_ms"]["relay_latency_ms"] == 0
+    assert row["attribution_candidates"] == ["source", "destination"]
+    assert row["attribution"] == "relay"
+    assert row["attribution_gap_ms"] == 0
+    assert row["negative_stages"] == []
+
+
+def test_attribution_audit_multiple_chains_preserve_input_order(workspace):
+    write_events(workspace["input"], interlocked_events())
+    _reports, audit = run_attribution_audit(workspace)
+
+    rows = read_attribution_audit(audit)
+    assert [
+        (r["chain_id"], r["sequence"], r["proof_status"]) for r in rows
+    ] == [
+        ("chain-a", 1, "verified"),
+        ("chain-b", 1, "verified"),
+        ("chain-a", 2, "verified"),
+        ("chain-b", 2, "verified"),
+        ("chain-a", 3, "verified"),
+        ("chain-b", 3, "verified"),
+    ]
+    assert [r["event_id"] for r in rows] == ["A1", "B1", "A2", "B2", "A3", "B3"]
+
+
+def test_attribution_audit_isolation_mode_includes_verified_and_failed(
+    workspace,
+):
+    write_events(workspace["input"], three_mixed_events())
+    reports, audit = run_attribution_audit(workspace, tolerate_failures=True)
+
+    assert [r["proof_status"] for r in reports] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    rows = read_attribution_audit(audit)
+    assert [r["proof_status"] for r in rows] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    # Failed rows still carry deterministic latencies/attribution identical to
+    # their report row, but no report-only error fields.
+    failed = rows[1]
+    failed_report = reports[1]
+    assert failed["latency_ms"] == {
+        "proof_latency_ms": failed_report["proof_latency_ms"],
+        "relay_latency_ms": failed_report["relay_latency_ms"],
+        "destination_latency_ms": failed_report["destination_latency_ms"],
+    }
+    assert failed["attribution"] == failed_report["attribution"]
+    assert "error_type" not in failed
+    assert "error_message" not in failed
+
+
+def test_attribution_audit_empty_input_atomically_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    audit.write_text("STALE\n", encoding="utf-8")
+    _reports, audit = run_attribution_audit(workspace)
+    assert audit.exists()
+    assert audit.read_text(encoding="utf-8") == ""
+
+
+def test_attribution_audit_omitted_writes_nothing(workspace):
+    write_events(workspace["input"], [make_event()])
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    run(workspace["input"], workspace["checkpoint"], workspace["output"])
+    assert not audit.exists()
+    assert workspace["output"].exists()
+
+
+def test_attribution_audit_covers_whole_input_across_resume_append_rerun(
+    workspace,
+):
+    first_batch = [
+        attr_event("chain-a", 1, "A1", 1000),
+        attr_event("chain-a", 4, "A4", 2000),
+    ]
+    write_events(workspace["input"], first_batch)
+    _reports, audit = run_attribution_audit(workspace)
+    assert [r["sequence"] for r in read_attribution_audit(audit)] == [1, 4]
+
+    second_batch = first_batch + [attr_event("chain-a", 7, "A7", 3000)]
+    write_events(workspace["input"], second_batch)
+    reports = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        attribution_audit_output=audit,
+    )
+    # Only the appended event is selected for the report; the audit covers
+    # all three.
+    assert [r["sequence"] for r in reports] == [7]
+    expected = read_attribution_audit(audit)
+    assert [r["sequence"] for r in expected] == [1, 4, 7]
+
+    # A no-op rerun rewrites the identical audit.
+    again = run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        attribution_audit_output=audit,
+    )
+    assert again == []
+    assert read_attribution_audit(audit) == expected
+
+
+def test_attribution_audit_atomically_replaces_stale_file(workspace):
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    audit.write_text("STALE\n", encoding="utf-8")
+    _reports, audit = run_attribution_audit(
+        workspace, [attr_event("chain-7", 1, "E1", 1000)]
+    )
+    rows = read_attribution_audit(audit)
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == "E1"
+    assert "STALE" not in audit.read_text(encoding="utf-8")
+
+
+def test_attribution_audit_strict_proof_failure_writes_nothing(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+    assert not workspace["checkpoint"].exists()
+
+
+def test_attribution_audit_strict_rerun_over_isolated_history_raises(
+    workspace,
+):
+    # First run in isolation mode commits a failed row and writes the audit.
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        tolerate_failures=True,
+        attribution_audit_output=audit,
+    )
+    output_before = workspace["output"].read_text()
+    audit_before = audit.read_text()
+
+    # A later STRICT run must surface the historically failed proof before
+    # publishing anything; the audit and report stay byte-for-byte intact.
+    with pytest.raises(ProofVerificationError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            tolerate_failures=False,
+            attribution_audit_output=audit,
+        )
+    assert audit.read_text() == audit_before
+    assert workspace["output"].read_text() == output_before
+
+
+def test_attribution_audit_malformed_input_writes_nothing(workspace):
+    workspace["input"].write_text("{not json\n", encoding="utf-8")
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_attribution_audit_duplicate_sequence_writes_nothing(workspace):
+    events = [
+        attr_event("chain-a", 1, "A1", 1000),
+        attr_event("chain-a", 1, "A2", 2000),
+    ]
+    write_events(workspace["input"], events)
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_attribution_audit_time_order_error_writes_nothing(workspace):
+    bad = make_event(
+        observed_at=1000,
+        proof_submitted_at=2600,
+        proof_verified_at=1500,
+        finalized_at=2400,
+    )
+    write_events(workspace["input"], [bad])
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    with pytest.raises(InvalidInputError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+    assert not audit.exists()
+
+
+def test_attribution_audit_checkpoint_error_writes_nothing(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps(v2_checkpoint({"chain-7": 99})), encoding="utf-8"
+    )
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+    with pytest.raises(CheckpointError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_attribution_audit_unwritable_path_raises_oserror_after_publish(
+    workspace,
+):
+    write_events(
+        workspace["input"],
+        [attr_event("chain-7", 1, "E1", 1000)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    audit = blocked / ATTR_AUDIT_PATH_NAME
+
+    with pytest.raises(OSError):
+        run(
+            workspace["input"],
+            workspace["checkpoint"],
+            workspace["output"],
+            attribution_audit_output=audit,
+        )
+
+    # The attribution audit is published last: report and checkpoint are safe.
+    assert not audit.exists()
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+
+
+def test_attribution_audit_does_not_change_any_other_output(workspace):
+    write_events(workspace["input"], [make_event()])
+    thresholds_path = workspace["output"].with_name("thresholds.json")
+    breach = workspace["output"].with_name("breach.jsonl")
+    profile = workspace["output"].with_name(PROFILE_PATH_NAME)
+    write_thresholds(thresholds_path, DEFAULT_THRESHOLDS)
+    slo_path = workspace["output"].with_name("slo.json")
+    health = workspace["output"].with_name(CHAIN_SLO_PATH_NAME)
+    write_slo(slo_path, CHAIN_SLO_ZERO_THRESHOLDS)
+    trend = workspace["output"].with_name(TREND_PATH_NAME)
+    continuity = workspace["output"].with_name("continuity.jsonl")
+    proof_audit = workspace["output"].with_name(AUDIT_PATH_NAME)
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    run(
+        workspace["input"],
+        workspace["checkpoint"],
+        workspace["output"],
+        continuity_output=continuity,
+        latency_thresholds=thresholds_path,
+        latency_breach_output=breach,
+        latency_profile_output=profile,
+        chain_slo_thresholds=slo_path,
+        chain_health_output=health,
+        trend_window_ms=10_000,
+        trend_output=trend,
+        proof_audit_output=proof_audit,
+        attribution_audit_output=audit,
+    )
+
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert continuity.exists()
+    assert len(read_breaches(breach)) == 1
+    assert len(read_profile(profile)) == 1
+    assert len(read_health(health)) == 1
+    assert len(read_trend(trend)) == 1
+    assert len(read_audit(proof_audit)) == 1
+    rows = read_attribution_audit(audit)
+    assert len(rows) == 1
+    assert rows[0]["proof_status"] == "verified"
+    assert rows[0]["attribution"] == "destination"
+    assert rows[0]["attribution_candidates"] == ["destination"]
+    assert rows[0]["latency_ms"] == {
+        "proof_latency_ms": 400,
+        "relay_latency_ms": 500,
+        "destination_latency_ms": 900,
+    }
+    assert rows[0]["attribution_gap_ms"] == 400
+    assert rows[0]["negative_stages"] == []
+    assert rows[0]["finalized_at"] == 2400
+
+
+# ---------------------------------------------------------------------------
+# Attribution audit CLI
+# ---------------------------------------------------------------------------
+
+
+def test_cli_attribution_audit_output_success(workspace):
+    write_events(
+        workspace["input"],
+        [
+            attr_event("chain-a", 1, "A1", 1000),
+            attr_event("chain-a", 2, "A2", 2000),
+        ],
+    )
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    rows = read_attribution_audit(audit)
+    assert [r["sequence"] for r in rows] == [1, 2]
+    assert all(r["proof_status"] == "verified" for r in rows)
+
+
+def test_cli_attribution_audit_empty_input_writes_empty_file(workspace):
+    workspace["input"].write_text("", encoding="utf-8")
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert audit.exists()
+    assert audit.read_text(encoding="utf-8") == ""
+
+
+def test_cli_attribution_audit_isolation_mode_includes_failed_rows(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--tolerate-failures",
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rows = read_attribution_audit(audit)
+    assert [r["proof_status"] for r in rows] == [
+        "verified",
+        "failed",
+        "verified",
+    ]
+    failed = rows[1]
+    assert failed["attribution_candidates"] == ["relay"]
+    assert "error_type" not in failed
+    assert "error_message" not in failed
+
+
+def test_cli_attribution_audit_strict_failure_leaves_no_audit_file(workspace):
+    write_events(workspace["input"], three_mixed_events())
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "ProofVerificationError"
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_attribution_audit_invalid_input_is_invalid_input_error(workspace):
+    workspace["input"].write_text("nope\n", encoding="utf-8")
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert payload["error"] == "InvalidInputError"
+    assert not audit.exists()
+    assert not workspace["output"].exists()
+
+
+def test_cli_attribution_audit_checkpoint_error_is_checkpoint_error(workspace):
+    write_events(workspace["input"], three_events())
+    workspace["checkpoint"].write_text(
+        json.dumps({"last_sequence": -5}), encoding="utf-8"
+    )
+    audit = workspace["output"].with_name(ATTR_AUDIT_PATH_NAME)
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "CheckpointError"
+    assert not audit.exists()
+
+
+def test_cli_attribution_audit_unwritable_path_is_oserror_json(workspace):
+    write_events(
+        workspace["input"],
+        [attr_event("chain-7", 1, "E1", 1000)],
+    )
+    blocked = workspace["output"].with_name("not-a-dir")
+    blocked.write_text("not a directory", encoding="utf-8")
+    audit = blocked / ATTR_AUDIT_PATH_NAME
+
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+        "--attribution-audit-output", str(audit),
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stderr)
+    assert set(payload.keys()) == {"error", "message"}
+    assert payload["error"] in {"OSError", "FileExistsError", "NotADirectoryError"}
+    assert isinstance(payload["message"], str) and payload["message"]
+    # The attribution audit is published last: every earlier artifact exists.
+    assert workspace["output"].exists()
+    assert read_checkpoint(workspace)["schema_version"] == 3
+    assert not audit.exists()
+
+
+def test_cli_attribution_audit_omitted_keeps_behavior(workspace):
+    write_events(workspace["input"], [make_event()])
+    result = run_cli(
+        "--input", str(workspace["input"]),
+        "--checkpoint", str(workspace["checkpoint"]),
+        "--output", str(workspace["output"]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert not workspace["output"].with_name(ATTR_AUDIT_PATH_NAME).exists()

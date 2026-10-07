@@ -12,7 +12,47 @@
 按检查点断点续传（v3 含续传输入前缀完整性保护）、原子 JSONL 报告；单个
 输入支持多个 chain_id；可选的逐事件失败隔离；可选的序列连续性缺口盘点；
 可选的延迟越界清单；可选的链级延迟画像；可选的链级 SLO 汇总；可选的链级
-时间窗口趋势画像；可选的轻客户端证明校验审计画像。
+时间窗口趋势画像；可选的轻客户端证明校验审计画像；可选的延迟归因审计
+画像。
+
+## 延迟归因审计画像
+
+传入 `--attribution-audit-output PATH`（模块 API 为
+`run(..., attribution_audit_output=PATH)`）后，在报告、检查点、连续性
+盘点、链级延迟画像、延迟越界清单（若有）、链级 SLO 汇总（若有）、链级
+时间窗口趋势画像（若有）与轻客户端证明校验审计画像（若有）都安全发布
+之后，**最后**原子替换一份 UTF-8 JSONL 审计画像。画像按**输入行序**为
+当前完整输入的**全部结构合法事件**各写一行，而非游标后的新行，因此续传、
+追加与重复执行结果一致，空输入原子写空文件。
+
+- 每行字段为 `event_id`、`chain_id`、`sequence`、`proof_status`、
+  `latency_ms`、`attribution`、`attribution_candidates`、
+  `attribution_gap_ms`、`negative_stages`、`finalized_at`。
+- `latency_ms` 仅含 `proof_latency_ms`、`relay_latency_ms`、
+  `destination_latency_ms` 三个有符号整数毫秒字段，口径与报告行完全
+  一致（负值保留，不钳为 0）。
+- `attribution` 沿用现有归因：取最大**非负**延迟阶段，任何并列（含
+  全等）归 `relay`。
+- `attribution_candidates` 按 `source`、`relay`、`destination` 的固定
+  顺序，列出非负延迟中与最高延迟并列的**全部**阶段名；唯一最高时只有
+  一项，并列时为多项（即 `attribution` 是否唯一最高可由此列表长度
+  判断）。
+- `attribution_gap_ms` 为非负延迟第一高与第二高之差；最高出现多次
+  （并列，含三项全等）时为 `0`。
+- `negative_stages` 按上述同序列出值为负的延迟阶段名；无负值时为
+  `[]`。
+- `proof_status` 与轻客户端证明校验审计画像同口径；审计画像是只读
+  推导：不参与游标与汇总，不改报告、检查点、输入前缀摘要或任何既有
+  输出。
+- 隔离模式（`--tolerate-failures true`）下成功与失败事件都入画像：
+  失败行仍有确定延迟与归因，`proof_status` 为 `failed`；严格模式证明
+  失败（含游标覆盖的历史失败事件，例如先前以隔离模式处理、本次改为严格
+  模式续传）仍在任何发布之前抛 `ProofVerificationError`，不写画像。
+- 结构错误、同链重复 `sequence`、时间顺序错误与检查点不合规仍抛
+  `InvalidInputError` 或 `CheckpointError`，CLI 错误 JSON 与退出码
+  不变且不写画像。画像路径不可写等文件错误沿用 CLI 的 OSError 子类
+  固定 JSON 错误与非零退出（此前已发布的产物不受影响）。
+- 省略该参数时 CLI、`run`、报告、检查点、异常与退出码与旧版完全一致。
 
 ## 轻客户端证明校验审计画像
 
